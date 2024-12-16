@@ -172,3 +172,24 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
  t
 (1 row)
 
+-- aborted calls tracking
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+SET statement_timeout = '50ms';
+SELECT pg_sleep(0.1);
+psql:sql/dml.sql:100: ERROR:  canceling statement due to statement timeout
+SELECT pg_sleep(0.1), 'test';
+psql:sql/dml.sql:101: ERROR:  canceling statement due to statement timeout
+SET statement_timeout = '0';
+SELECT query, calls, calls_aborted FROM pg_stat_statements
+WHERE query LIKE '%pg_sleep%' ORDER BY query COLLATE "C";
+          query          | calls | calls_aborted 
+-------------------------+-------+---------------
+ SELECT pg_sleep($1)     |     1 |             1
+ SELECT pg_sleep($1), $2 |     0 |             1
+(2 rows)
+

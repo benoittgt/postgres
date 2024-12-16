@@ -98,7 +98,7 @@ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
 #define STICKY_DECREASE_FACTOR	(0.50)	/* factor for sticky entries */
 #define USAGE_DEALLOC_PERCENT	5	/* free this % of entries at once */
-#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC]) == 0)
+#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC] + c.calls_aborted) == 0)
 
 /*
  * Extension version number, for supporting older extension versions' objects
@@ -155,6 +155,9 @@ typedef struct pgssHashKey
 typedef struct Counters
 {
 	int64		calls[PGSS_NUMKIND];	/* # of times planned/executed */
+
+	int64       calls_aborted;          /* # of times query was aborted */
+
 	double		total_time[PGSS_NUMKIND];	/* total planning/execution time,
 											 * in msec */
 	double		min_time[PGSS_NUMKIND]; /* minimum planning/execution time in
@@ -1033,6 +1036,8 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
+	bool query_completed = false;
+
 	nesting_level++;
 	PG_TRY();
 	{
@@ -1040,9 +1045,42 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 			prev_ExecutorRun(queryDesc, direction, count);
 		else
 			standard_ExecutorRun(queryDesc, direction, count);
+
+		/* Mark as completed if we reach here */
+		query_completed = true;
 	}
 	PG_FINALLY();
 	{
+		/* If query didn't complete, it was aborted (timeout/cancel) */
+		if (!query_completed && pgss && pgss_enabled(nesting_level) &&
+			queryDesc->plannedstmt->queryId != UINT64CONST(0))
+		{
+			pgssHashKey key;
+			pgssEntry *entry;
+
+			/* Clear padding to ensure proper hash key comparison */
+			memset(&key, 0, sizeof(pgssHashKey));
+
+			key.userid = GetUserId();
+			key.dbid = MyDatabaseId;
+			/* nesting_level was incremented at start of ExecutorRun */
+			key.toplevel = (nesting_level == 1);
+			key.queryid = queryDesc->plannedstmt->queryId;
+
+			LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
+
+			/* Entry should exist from pgss_post_parse_analyze, even for first-time failures */
+			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
+
+			if (entry)
+			{
+				SpinLockAcquire(&entry->mutex);
+				entry->counters.calls_aborted++;
+				SpinLockRelease(&entry->mutex);
+			}
+			LWLockRelease(pgss->lock);
+		}
+
 		nesting_level--;
 	}
 	PG_END_TRY();
@@ -1578,8 +1616,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
 #define PG_STAT_STATEMENTS_COLS_V1_10	43
 #define PG_STAT_STATEMENTS_COLS_V1_11	49
 #define PG_STAT_STATEMENTS_COLS_V1_12	52
-#define PG_STAT_STATEMENTS_COLS_V1_13	54
-#define PG_STAT_STATEMENTS_COLS			54	/* maximum of above */
+#define PG_STAT_STATEMENTS_COLS_V1_13	55
+#define PG_STAT_STATEMENTS_COLS			55	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -1922,6 +1960,13 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			if (kind == PGSS_EXEC || api_version >= PGSS_V1_8)
 			{
 				values[i++] = Int64GetDatumFast(tmp.calls[kind]);
+
+				/* Add calls_aborted right after execution calls */
+				if (kind == PGSS_EXEC && api_version >= PGSS_V1_13)
+				{
+					values[i++] = Int64GetDatumFast(tmp.calls_aborted);
+				}
+
 				values[i++] = Float8GetDatumFast(tmp.total_time[kind]);
 			}
 
