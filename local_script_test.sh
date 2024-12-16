@@ -1,8 +1,9 @@
 export DYLD_LIBRARY_PATH=$PG_TEST_DIR/lib:$DYLD_LIBRARY_PATH
 export PATH=$PG_TEST_DIR/bin:$PATH
 
-# $PG_TEST_DIR/bin/createdb -p 5433 test
-# $PG_TEST_DIR/bin/psql -p 5433 test -c "CREATE EXTENSION pg_stat_statements;"
+# create if not exists
+$PG_TEST_DIR/bin/createdb -p 5433 test
+$PG_TEST_DIR/bin/psql -p 5433 test -c "CREATE EXTENSION pg_stat_statements;"
 
 $PG_TEST_DIR/bin/psql -p 5433 test -c "
 DROP TABLE IF EXISTS test_table;
@@ -14,6 +15,8 @@ INSERT INTO test_table (data)
 SELECT 'data_' || generate_series(1,1000);
 
 SET statement_timeout = '1s';
+
+SELECT pg_stat_statements_reset();
 
 -- Two working queries
 SELECT count(*) FROM test_table;
