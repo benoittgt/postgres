@@ -1,9 +1,19 @@
 export DYLD_LIBRARY_PATH=$PG_TEST_DIR/lib:$DYLD_LIBRARY_PATH
 export PATH=$PG_TEST_DIR/bin:$PATH
 
+$PG_TEST_DIR/bin/pg_ctl -D $PG_TEST_DIR/data -l $PG_TEST_DIR/logfile restart
+
 # create if not exists
 $PG_TEST_DIR/bin/createdb -p 5433 test
+$PG_TEST_DIR/bin/psql -p 5433 test -c "DROP EXTENSION pg_stat_statements;"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "CREATE EXTENSION pg_stat_statements;"
+
+$PG_TEST_DIR/bin/psql -p 5433 test -c "
+ALTER SYSTEM SET log_min_messages = 'info';
+ALTER SYSTEM SET client_min_messages = 'info';
+"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';"
+
 
 $PG_TEST_DIR/bin/psql -p 5433 test -c "
 DROP TABLE IF EXISTS test_table;

@@ -915,17 +915,21 @@ pgss_planner(Query *parse,
 		walusage_start = pgWalUsage;
 		INSTR_TIME_SET_CURRENT(start);
 
+		elog(INFO, "benoit: executing query");
+
 		nesting_level++;
 		PG_TRY();
-		{
-			if (prev_planner_hook)
-				result = prev_planner_hook(parse, query_string, cursorOptions,
-										   boundParams);
-			else
-				result = standard_planner(parse, query_string, cursorOptions,
-										  boundParams);
-		}
-		PG_FINALLY();
+        {
+            if (prev_planner_hook)
+                result = prev_planner_hook(parse, query_string, cursorOptions,
+                                           boundParams);
+            else
+                result = standard_planner(parse, query_string, cursorOptions,
+                                          boundParams);
+
+			/* Log at INFO level for general visibility */
+        }
+        PG_FINALLY();
 		{
 			nesting_level--;
 		}
@@ -1159,6 +1163,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		walusage_start = pgWalUsage;
 		INSTR_TIME_SET_CURRENT(start);
 
+		elog(INFO, "benoit: executing query");
+
 		nesting_level++;
 		PG_TRY();
 		{
@@ -1304,6 +1310,9 @@ pgss_store(const char *query, uint64 queryId,
 	if (queryId == UINT64CONST(0))
 		return;
 
+	/* Add debug log */
+	elog(DEBUG1, "----------------: %s", query);
+
 	/*
 	 * Confine our attention to the relevant part of the string, if the query
 	 * is a portion of a multi-statement source string, and update query
@@ -1404,7 +1413,9 @@ pgss_store(const char *query, uint64 queryId,
 		if (IS_STICKY(entry->counters))
 			entry->counters.usage = USAGE_INIT;
 
+        /* We want to do someting similar */
 		entry->counters.calls[kind] += 1;
+		elog(INFO, "benoit: entry->counters.calls[kind] = %lld", entry->counters.calls[kind]);
 		entry->counters.total_time[kind] += total_time;
 
 		if (entry->counters.calls[kind] == 1)
