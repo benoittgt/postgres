@@ -1,7 +1,7 @@
-/* contrib/pg_stat_statements/pg_stat_statements--1.11--1.12.sql */
+/* contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql */
 
 -- complain if script is sourced in psql, rather than via ALTER EXTENSION
-\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.12'" to load this file. \quit
+\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.13'" to load this file. \quit
 
 /* First we have to remove them from the extension */
 ALTER EXTENSION pg_stat_statements DROP VIEW pg_stat_statements;
@@ -25,6 +25,8 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT mean_plan_time float8,
     OUT stddev_plan_time float8,
     OUT calls int8,
+    OUT initiated int8,
+    OUT completed int8,
     OUT total_exec_time float8,
     OUT min_exec_time float8,
     OUT max_exec_time float8,
@@ -67,7 +69,7 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT
 )
 RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'pg_stat_statements_1_12'
+AS 'MODULE_PATHNAME', 'pg_stat_statements_1_13'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
 CREATE VIEW pg_stat_statements AS
