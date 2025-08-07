@@ -18,27 +18,8 @@ $PG_TEST_DIR/bin/psql -p 5433 test -c "CREATE EXTENSION pg_stat_statements;"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "ALTER SYSTEM SET log_min_messages = 'info';"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "ALTER SYSTEM SET client_min_messages = 'info';"
 
-# Skip reload for now as it seems to hang with verbose logging
-echo "Skipping pg_reload_conf() due to verbose logging - restart will pick up changes"
-
-$PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';"
-
-$PG_TEST_DIR/bin/psql -p 5433 test -c "DROP TABLE IF EXISTS test_table;"
-echo "🦀 Creating test_table in test database..."
-$PG_TEST_DIR/bin/psql -p 5433 test -c "CREATE TABLE test_table (
-    id serial PRIMARY KEY,
-    data text
-);"
-$PG_TEST_DIR/bin/psql -p 5433 test -c "INSERT INTO test_table (data) SELECT 'data_' || generate_series(1,1000);"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "SET statement_timeout = '1s';
-
 SELECT pg_stat_statements_reset();
-
--- Two working queries
-SELECT count(*) FROM test_table;
-SELECT data FROM test_table WHERE id = 42;
-
--- One query that will timeout
 SELECT pg_sleep(2), count(*) FROM test_table;
 "
 
