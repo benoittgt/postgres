@@ -111,7 +111,6 @@ typedef enum pgssVersion
 	PGSS_V1_10,
 	PGSS_V1_11,
 	PGSS_V1_12,
-	PGSS_V1_13,
 } pgssVersion;
 
 typedef enum pgssStoreKind
@@ -153,7 +152,7 @@ typedef struct Counters
 {
 	int64		calls[PGSS_NUMKIND];	/* # of times planned/executed */
 
-	int64       calls_initiated;              /* # of times query was initiated */
+	int64       calls_aborted;              /* # of times query was aborted */
 
 	double		total_time[PGSS_NUMKIND];	/* total planning/execution time,
 											 * in msec */
@@ -920,28 +919,21 @@ pgss_planner(Query *parse,
 		walusage_start = pgWalUsage;
 		INSTR_TIME_SET_CURRENT(start);
 
-		elog(INFO, ">>>>>>> benoit: executing query");
-
 		nesting_level++;
 		PG_TRY();
-        {
-			elog(INFO, ">>>>>>> benoit: before prev_planner_hook");
-            if (prev_planner_hook)
-                result = prev_planner_hook(parse, query_string, cursorOptions,
-                                           boundParams);
-            else
-                result = standard_planner(parse, query_string, cursorOptions,
-                                          boundParams);
-
-			/* Log at INFO level for general visibility */
-        }
-        PG_FINALLY();
+		{
+			if (prev_planner_hook)
+				result = prev_planner_hook(parse, query_string, cursorOptions,
+										   boundParams);
+			else
+				result = standard_planner(parse, query_string, cursorOptions,
+										  boundParams);
+		}
+		PG_FINALLY();
 		{
 			nesting_level--;
 		}
 		PG_END_TRY();
-
-		elog(INFO, ">>>>>>> benoit: after executing query");
 
 		INSTR_TIME_SET_CURRENT(duration);
 		INSTR_TIME_SUBTRACT(duration, start);
@@ -978,7 +970,6 @@ pgss_planner(Query *parse,
 		nesting_level++;
 		PG_TRY();
 		{
-			elog(INFO, ">>>>>>> benoit: before prev_planner_hook 2");
 			if (prev_planner_hook)
 				result = prev_planner_hook(parse, query_string, cursorOptions,
 										   boundParams);
@@ -1033,117 +1024,26 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 /*
  * ExecutorRun hook: all we need do is track nesting depth
  */
-// static void
-// pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
-// {
-// 	nesting_level++;
-// 	PG_TRY();
-// 	{
-// 		elog(INFO, ">>>>>>> benoit: before prev_ExecutorRun");
-// 		if (prev_ExecutorRun)
-// 		{
-// 			elog(INFO, ">>>>>>> benoit: before prev_ExecutorRun(queryDesc, direction, count)");
-// 			prev_ExecutorRun(queryDesc, direction, count);
-// 		}
-// 		else
-// 		{
-// 			elog(INFO, ">>>>>>> benoit: before standard_ExecutorRun");
-// 			standard_ExecutorRun(queryDesc, direction, count);
-// 		}
-// 	}
-//     PG_CATCH();
-//     {
-//         /* Log that we caught an error during execution */
-//         elog(INFO, "benoit: ExecutorRun failed for query: %s", queryDesc->sourceText);
-
-//         nesting_level--;
-//         PG_RE_THROW();
-//     }
-// 	PG_END_TRY();
-//     nesting_level--;
-// }
-
 static void
 pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
-    pgssHashKey key;
-    pgssEntry  *entry = NULL;
-    // bool        failed = false;
-
-    /* Only track if enabled and has queryId */
-    if (pgss_enabled(nesting_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
-    {
-        /* Set up key for hashtable search */
-        memset(&key, 0, sizeof(pgssHashKey));
-        key.userid = GetUserId();
-        key.dbid = MyDatabaseId;
-        key.queryid = queryDesc->plannedstmt->queryId;
-        key.toplevel = (nesting_level == 0);
-
-        /* Track initiation */
-        LWLockAcquire(pgss->lock, LW_SHARED);
-        entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
-        if (entry)
-        {
-            SpinLockAcquire(&entry->mutex);
-            entry->counters.calls_initiated++;
-            elog(INFO, "benoit: query initiated (calls=%lld, initiated=%lld): %s",
-                 entry->counters.calls[PGSS_EXEC],
-                 entry->counters.calls_initiated,
-                 queryDesc->sourceText);
-            SpinLockRelease(&entry->mutex);
-        }
-        else
-        {
-            /* If entry doesn't exist, create it with just the query text */
-            LWLockRelease(pgss->lock);
-            LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
-
-            /* Create entry with just query text and initiated=1 */
-            entry = entry_alloc(&key, 0, 0, GetDatabaseEncoding(), false);
-            if (entry)
-            {
-                SpinLockAcquire(&entry->mutex);
-                entry->counters.calls_initiated = 1;
-                SpinLockRelease(&entry->mutex);
-
-                /* Store the query text */
-                pgss_store(queryDesc->sourceText,
-                          queryDesc->plannedstmt->queryId,
-                          queryDesc->plannedstmt->stmt_location,
-                          queryDesc->plannedstmt->stmt_len,
-                          PGSS_INVALID,  /* Just storing query text */
-                          0,    /* no timing */
-                          0,    /* no rows */
-                          NULL, /* no buffer usage */
-                          NULL, /* no WAL usage */
-                          NULL, /* no JIT stats */
-                          NULL,
-                          0,
-                          0);
-            }
-        }
-        LWLockRelease(pgss->lock);
-    }
-
-    nesting_level++;
-    PG_TRY();
-    {
-        if (prev_ExecutorRun)
-            prev_ExecutorRun(queryDesc, direction, count);
-        else
-            standard_ExecutorRun(queryDesc, direction, count);
-    }
+	nesting_level++;
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
     PG_CATCH();
-    {
+	{
         elog(INFO, "benoit: query failed (timeout/cancel): %s", queryDesc->sourceText);
-        nesting_level--;
+		nesting_level--;
         PG_RE_THROW();
-    }
-    PG_END_TRY();
+	}
+	PG_END_TRY();
     nesting_level--;
 }
-
 
 /*
  * ExecutorFinish hook: all we need do is track nesting depth
@@ -1174,8 +1074,6 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 {
 	uint64		queryId = queryDesc->plannedstmt->queryId;
 
-	elog(INFO, ">>>>>>> benoit: ExecutorEnd");
-
 	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
 		pgss_enabled(nesting_level))
 	{
@@ -1198,7 +1096,6 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 				   NULL,
 				   queryDesc->estate->es_parallel_workers_to_launch,
 				   queryDesc->estate->es_parallel_workers_launched);
-
 	}
 
 	if (prev_ExecutorEnd)
@@ -1268,8 +1165,6 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		bufusage_start = pgBufferUsage;
 		walusage_start = pgWalUsage;
 		INSTR_TIME_SET_CURRENT(start);
-
-		// elog(INFO, ">>>>>>>>> benoit: executing query");
 
 		nesting_level++;
 		PG_TRY();
@@ -1416,8 +1311,6 @@ pgss_store(const char *query, uint64 queryId,
 	if (queryId == UINT64CONST(0))
 		return;
 
-	/* Add debug log */
-
 	/*
 	 * Confine our attention to the relevant part of the string, if the query
 	 * is a portion of a multi-statement source string, and update query
@@ -1508,9 +1401,6 @@ pgss_store(const char *query, uint64 queryId,
 	{
 		Assert(kind == PGSS_PLAN || kind == PGSS_EXEC);
 
-		// elog(INFO, "benoit: query initiated: %s", query);
-		entry->counters.calls_initiated += 1;
-
 		/*
 		 * Grab the spinlock while updating the counters (see comment about
 		 * locking rules at the head of the file)
@@ -1521,9 +1411,7 @@ pgss_store(const char *query, uint64 queryId,
 		if (IS_STICKY(entry->counters))
 			entry->counters.usage = USAGE_INIT;
 
-        /* We want to do someting similar */
 		entry->counters.calls[kind] += 1;
-		// elog(INFO, "benoit: entry->counters.calls[kind] = %lld", entry->counters.calls[kind]);
 		entry->counters.total_time[kind] += total_time;
 
 		if (entry->counters.calls[kind] == 1)
@@ -1677,8 +1565,7 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
 #define PG_STAT_STATEMENTS_COLS_V1_10	43
 #define PG_STAT_STATEMENTS_COLS_V1_11	49
 #define PG_STAT_STATEMENTS_COLS_V1_12	51
-#define PG_STAT_STATEMENTS_COLS_V1_13   52
-#define PG_STAT_STATEMENTS_COLS			52	/* maximum of above */
+#define PG_STAT_STATEMENTS_COLS			51	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -1690,16 +1577,6 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
  * expected API version is identified by embedding it in the C name of the
  * function.  Unfortunately we weren't bright enough to do that for 1.1.
  */
-Datum
-pg_stat_statements_1_13(PG_FUNCTION_ARGS)
-{
-	bool		showtext = PG_GETARG_BOOL(0);
-
-	pg_stat_statements_internal(fcinfo, PGSS_V1_13, showtext);
-
-	return (Datum) 0;
-}
-
 Datum
 pg_stat_statements_1_12(PG_FUNCTION_ARGS)
 {
@@ -1856,10 +1733,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			break;
 		case PG_STAT_STATEMENTS_COLS_V1_12:
 			if (api_version != PGSS_V1_12)
-				elog(ERROR, "incorrect number of output arguments");
-			break;
-		case PG_STAT_STATEMENTS_COLS_V1_13:
-			if (api_version != PGSS_V1_13)
 				elog(ERROR, "incorrect number of output arguments");
 			break;
 		default:
@@ -2044,13 +1917,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 				values[i++] = Float8GetDatumFast(stddev);
 			}
 		}
-
-		/* Add calls_initiated columns for version 1.13 */
-		if (api_version >= PGSS_V1_13)
-		{
-			values[i++] = Int64GetDatumFast(tmp.calls_initiated);
-		}
-
 		values[i++] = Int64GetDatumFast(tmp.rows);
 		values[i++] = Int64GetDatumFast(tmp.shared_blks_hit);
 		values[i++] = Int64GetDatumFast(tmp.shared_blks_read);
@@ -2132,7 +1998,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 					 api_version == PGSS_V1_10 ? PG_STAT_STATEMENTS_COLS_V1_10 :
 					 api_version == PGSS_V1_11 ? PG_STAT_STATEMENTS_COLS_V1_11 :
 					 api_version == PGSS_V1_12 ? PG_STAT_STATEMENTS_COLS_V1_12 :
-					 api_version == PGSS_V1_13 ? PG_STAT_STATEMENTS_COLS_V1_13 :
 					 -1 /* fail if you forget to update this assert */ ));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
@@ -2228,7 +2093,6 @@ entry_alloc(pgssHashKey *key, Size query_offset, int query_len, int encoding,
 
 		/* reset the statistics */
 		memset(&entry->counters, 0, sizeof(Counters));
-        entry->counters.calls_initiated = 0;
 		/* set the appropriate initial usage count */
 		entry->counters.usage = sticky ? pgss->cur_median_usage : USAGE_INIT;
 		/* re-initialize the mutex each time ... we assume no one using it */
