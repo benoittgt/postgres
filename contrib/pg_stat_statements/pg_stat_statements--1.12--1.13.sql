@@ -25,8 +25,7 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT mean_plan_time float8,
     OUT stddev_plan_time float8,
     OUT calls int8,
-    OUT initiated int8,
-    OUT completed int8,
+    OUT calls_initiated int8,
     OUT total_exec_time float8,
     OUT min_exec_time float8,
     OUT max_exec_time float8,
@@ -65,8 +64,7 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT parallel_workers_to_launch int8,
     OUT parallel_workers_launched int8,
     OUT stats_since timestamp with time zone,
-    OUT minmax_stats_since timestamp with time zone,
-    OUT
+    OUT minmax_stats_since timestamp with time zone
 )
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_stat_statements_1_13'

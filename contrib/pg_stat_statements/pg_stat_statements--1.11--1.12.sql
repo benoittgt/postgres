@@ -63,8 +63,7 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT parallel_workers_to_launch int8,
     OUT parallel_workers_launched int8,
     OUT stats_since timestamp with time zone,
-    OUT minmax_stats_since timestamp with time zone,
-    OUT
+    OUT minmax_stats_since timestamp with time zone
 )
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_stat_statements_1_12'

@@ -153,8 +153,7 @@ typedef struct Counters
 {
 	int64		calls[PGSS_NUMKIND];	/* # of times planned/executed */
 
-	int64       initiated;              /* # of times query was initiated */
-    int64       completed;              /* # of times query completed successfully */
+	int64       calls_initiated;              /* # of times query was initiated */
 
 	double		total_time[PGSS_NUMKIND];	/* total planning/execution time,
 											 * in msec */
@@ -1069,7 +1068,7 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
     pgssHashKey key;
     pgssEntry  *entry = NULL;
-    bool        failed = false;
+    // bool        failed = false;
 
     /* Only track if enabled and has queryId */
     if (pgss_enabled(nesting_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
@@ -1087,10 +1086,10 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
         if (entry)
         {
             SpinLockAcquire(&entry->mutex);
-            entry->counters.initiated++;
-            elog(INFO, "benoit: query initiated (calls=%ld, initiated=%ld): %s",
+            entry->counters.calls_initiated++;
+            elog(INFO, "benoit: query initiated (calls=%lld, initiated=%lld): %s",
                  entry->counters.calls[PGSS_EXEC],
-                 entry->counters.initiated,
+                 entry->counters.calls_initiated,
                  queryDesc->sourceText);
             SpinLockRelease(&entry->mutex);
         }
@@ -1105,7 +1104,7 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
             if (entry)
             {
                 SpinLockAcquire(&entry->mutex);
-                entry->counters.initiated = 1;
+                entry->counters.calls_initiated = 1;
                 SpinLockRelease(&entry->mutex);
 
                 /* Store the query text */
@@ -1200,7 +1199,6 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 				   queryDesc->estate->es_parallel_workers_to_launch,
 				   queryDesc->estate->es_parallel_workers_launched);
 
-	    // entry->counters.completed += 1;
 	}
 
 	if (prev_ExecutorEnd)
@@ -1271,7 +1269,7 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		walusage_start = pgWalUsage;
 		INSTR_TIME_SET_CURRENT(start);
 
-		elog(INFO, ">>>>>>>>> benoit: executing query");
+		// elog(INFO, ">>>>>>>>> benoit: executing query");
 
 		nesting_level++;
 		PG_TRY();
@@ -1510,8 +1508,8 @@ pgss_store(const char *query, uint64 queryId,
 	{
 		Assert(kind == PGSS_PLAN || kind == PGSS_EXEC);
 
-		elog(INFO, "benoit: query initiated: %s", query);
-		entry->counters.initiated += 1;
+		// elog(INFO, "benoit: query initiated: %s", query);
+		entry->counters.calls_initiated += 1;
 
 		/*
 		 * Grab the spinlock while updating the counters (see comment about
@@ -1525,7 +1523,7 @@ pgss_store(const char *query, uint64 queryId,
 
         /* We want to do someting similar */
 		entry->counters.calls[kind] += 1;
-		elog(INFO, "benoit: entry->counters.calls[kind] = %lld", entry->counters.calls[kind]);
+		// elog(INFO, "benoit: entry->counters.calls[kind] = %lld", entry->counters.calls[kind]);
 		entry->counters.total_time[kind] += total_time;
 
 		if (entry->counters.calls[kind] == 1)
@@ -1679,8 +1677,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
 #define PG_STAT_STATEMENTS_COLS_V1_10	43
 #define PG_STAT_STATEMENTS_COLS_V1_11	49
 #define PG_STAT_STATEMENTS_COLS_V1_12	51
-#define PG_STAT_STATEMENTS_COLS_V1_13   53
-#define PG_STAT_STATEMENTS_COLS			53	/* maximum of above */
+#define PG_STAT_STATEMENTS_COLS_V1_13   52
+#define PG_STAT_STATEMENTS_COLS			52	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -2046,6 +2044,13 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 				values[i++] = Float8GetDatumFast(stddev);
 			}
 		}
+
+		/* Add calls_initiated columns for version 1.13 */
+		if (api_version >= PGSS_V1_13)
+		{
+			values[i++] = Int64GetDatumFast(tmp.calls_initiated);
+		}
+
 		values[i++] = Int64GetDatumFast(tmp.rows);
 		values[i++] = Int64GetDatumFast(tmp.shared_blks_hit);
 		values[i++] = Int64GetDatumFast(tmp.shared_blks_read);
@@ -2111,11 +2116,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		{
 			values[i++] = Int64GetDatumFast(tmp.parallel_workers_to_launch);
 			values[i++] = Int64GetDatumFast(tmp.parallel_workers_launched);
-		}
-		if (api_version >= PGSS_V1_13)
-		{
-			values[i++] = Int64GetDatumFast(tmp.initiated);
-			values[i++] = Int64GetDatumFast(tmp.completed);
 		}
 		if (api_version >= PGSS_V1_11)
 		{
@@ -2228,8 +2228,7 @@ entry_alloc(pgssHashKey *key, Size query_offset, int query_len, int encoding,
 
 		/* reset the statistics */
 		memset(&entry->counters, 0, sizeof(Counters));
-        entry->counters.initiated = 0;
-        entry->counters.completed = 0;
+        entry->counters.calls_initiated = 0;
 		/* set the appropriate initial usage count */
 		entry->counters.usage = sticky ? pgss->cur_median_usage : USAGE_INIT;
 		/* re-initialize the mutex each time ... we assume no one using it */
