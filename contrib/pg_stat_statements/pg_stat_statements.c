@@ -1012,8 +1012,66 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * counting of optimizable statements that are directly contained in
 	 * utility statements.
 	 */
+	elog(INFO, "BENOIT DEBUG: pgss_ExecutorStart called with queryId %llu", queryDesc->plannedstmt->queryId);
 	if (pgss_enabled(nesting_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
 	{
+		elog(INFO, "BENOIT DEBUG: About to track execution start and create persistent entry");
+
+		/* Create persistent entry immediately for timeout tracking */
+		{
+			pgssHashKey key;
+			pgssEntry  *entry;
+			bool		found;
+			uint64 queryId = queryDesc->plannedstmt->queryId;
+			const char *query = queryDesc->sourceText;
+
+			elog(INFO, "BENOIT DEBUG: Setting up hash key for queryId %llu", queryId);
+
+			/* Set up key for hashtable search */
+			memset(&key, 0, sizeof(pgssHashKey));
+			key.userid = GetUserId();
+			key.dbid = MyDatabaseId;
+			key.queryid = queryId;
+			key.toplevel = (nesting_level == 0);
+
+			elog(INFO, "BENOIT DEBUG: Key - userid=%u, dbid=%u, queryid=%llu, toplevel=%d, nesting_level=%d",
+				 key.userid, key.dbid, key.queryid, key.toplevel, nesting_level);
+
+			/* Get exclusive lock to create/update entry */
+			LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
+
+			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_ENTER, &found);
+
+			if (!found)
+			{
+				elog(INFO, "BENOIT DEBUG: Creating new persistent entry for queryId %llu", queryId);
+				/* New entry - initialize with calls_initiated only */
+				memset(&entry->counters, 0, sizeof(Counters));
+				entry->counters.calls_initiated = 1;       /* Track initiation */
+				entry->counters.usage = USAGE_INIT;
+				entry->query_offset = 0;
+				entry->query_len = 0;
+				entry->encoding = GetDatabaseEncoding();
+				entry->stats_since = GetCurrentTimestamp();
+				entry->minmax_stats_since = GetCurrentTimestamp();
+				SpinLockInit(&entry->mutex);
+				elog(INFO, "BENOIT DEBUG: New persistent entry created with calls_initiated = %lld, calls[EXEC] = %lld",
+					 entry->counters.calls_initiated, entry->counters.calls[PGSS_EXEC]);
+			}
+			else
+			{
+				elog(INFO, "BENOIT DEBUG: Found existing entry for queryId %llu", queryId);
+				/* Existing entry - increment calls_initiated */
+				SpinLockAcquire(&entry->mutex);
+				entry->counters.calls_initiated++;
+				elog(INFO, "BENOIT DEBUG: Incremented calls_initiated to %lld",
+					 entry->counters.calls_initiated);
+				SpinLockRelease(&entry->mutex);
+			}
+
+			LWLockRelease(pgss->lock);
+		}
+
 		/*
 		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
 		 * space is allocated in the per-query context so it will go away at
@@ -1066,82 +1124,21 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
-    pgssHashKey key;
-    pgssEntry  *entry = NULL;
-    // bool        failed = false;
+		elog(INFO, ">>>>>>> benoit: ExecutorRun called");
 
-    /* Only track if enabled and has queryId */
-    if (pgss_enabled(nesting_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
-    {
-        /* Set up key for hashtable search */
-        memset(&key, 0, sizeof(pgssHashKey));
-        key.userid = GetUserId();
-        key.dbid = MyDatabaseId;
-        key.queryid = queryDesc->plannedstmt->queryId;
-        key.toplevel = (nesting_level == 0);
-
-        /* Track initiation */
-        LWLockAcquire(pgss->lock, LW_SHARED);
-        entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
-        if (entry)
+	    nesting_level++;
+        PG_TRY();
         {
-            SpinLockAcquire(&entry->mutex);
-            entry->counters.calls_initiated++;
-            elog(INFO, "benoit: query initiated (calls=%lld, initiated=%lld): %s",
-                 entry->counters.calls[PGSS_EXEC],
-                 entry->counters.calls_initiated,
-                 queryDesc->sourceText);
-            SpinLockRelease(&entry->mutex);
+                if (prev_ExecutorRun)
+                        prev_ExecutorRun(queryDesc, direction, count);
+                else
+                        standard_ExecutorRun(queryDesc, direction, count);
         }
-        else
+        PG_FINALLY();
         {
-            /* If entry doesn't exist, create it with just the query text */
-            LWLockRelease(pgss->lock);
-            LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
-
-            /* Create entry with just query text and initiated=1 */
-            entry = entry_alloc(&key, 0, 0, GetDatabaseEncoding(), false);
-            if (entry)
-            {
-                SpinLockAcquire(&entry->mutex);
-                entry->counters.calls_initiated = 1;
-                SpinLockRelease(&entry->mutex);
-
-                /* Store the query text */
-                pgss_store(queryDesc->sourceText,
-                          queryDesc->plannedstmt->queryId,
-                          queryDesc->plannedstmt->stmt_location,
-                          queryDesc->plannedstmt->stmt_len,
-                          PGSS_INVALID,  /* Just storing query text */
-                          0,    /* no timing */
-                          0,    /* no rows */
-                          NULL, /* no buffer usage */
-                          NULL, /* no WAL usage */
-                          NULL, /* no JIT stats */
-                          NULL,
-                          0,
-                          0);
-            }
+                nesting_level--;
         }
-        LWLockRelease(pgss->lock);
-    }
-
-    nesting_level++;
-    PG_TRY();
-    {
-        if (prev_ExecutorRun)
-            prev_ExecutorRun(queryDesc, direction, count);
-        else
-            standard_ExecutorRun(queryDesc, direction, count);
-    }
-    PG_CATCH();
-    {
-        elog(INFO, "benoit: query failed (timeout/cancel): %s", queryDesc->sourceText);
-        nesting_level--;
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-    nesting_level--;
+        PG_END_TRY();
 }
 
 
@@ -1495,8 +1492,10 @@ pgss_store(const char *query, uint64 queryId,
 			goto done;
 
 		/* OK to create a new hashtable entry */
+		elog(INFO, "BENOIT DEBUG: pgss_store creating new entry for queryId %llu", queryId);
 		entry = entry_alloc(&key, query_offset, query_len, encoding,
 							jstate != NULL);
+		elog(INFO, "BENOIT DEBUG: pgss_store created entry, calls_initiated = %lld", entry->counters.calls_initiated);
 
 		/* If needed, perform garbage collection while exclusive lock held */
 		if (do_gc)
@@ -1508,13 +1507,11 @@ pgss_store(const char *query, uint64 queryId,
 	{
 		Assert(kind == PGSS_PLAN || kind == PGSS_EXEC);
 
-		// elog(INFO, "benoit: query initiated: %s", query);
-		entry->counters.calls_initiated += 1;
-
 		/*
 		 * Grab the spinlock while updating the counters (see comment about
 		 * locking rules at the head of the file)
 		 */
+		elog(INFO, "BENOIT DEBUG: pgss_store updating entry for queryId %llu, calls_initiated was %lld", queryId, entry->counters.calls_initiated);
 		SpinLockAcquire(&entry->mutex);
 
 		/* "Unstick" entry if it was previously sticky */
@@ -2004,6 +2001,9 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		tmp = entry->counters;
 		SpinLockRelease(&entry->mutex);
 
+		elog(INFO, "BENOIT DEBUG: SQL view reading entry for queryId %lld - calls[EXEC]=%lld, calls_initiated=%lld",
+			 (long long)entry->key.queryid, tmp.calls[PGSS_EXEC], tmp.calls_initiated);
+
 		/*
 		 * The spinlock is not required when reading these two as they are
 		 * always updated when holding pgss->lock exclusively.
@@ -2012,8 +2012,12 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		minmax_stats_since = entry->minmax_stats_since;
 
 		/* Skip entry if unexecuted (ie, it's a pending "sticky" entry) */
-		if (IS_STICKY(tmp))
+		/* But include entries that have calls_initiated > 0 (timeout tracking) */
+		if (IS_STICKY(tmp) && tmp.calls_initiated == 0)
 			continue;
+
+		elog(INFO, "BENOIT DEBUG: Including entry in SQL result - queryId=%lld, calls[EXEC]=%lld, calls_initiated=%lld",
+			 (long long)entry->key.queryid, tmp.calls[PGSS_EXEC], tmp.calls_initiated);
 
 		/* Note that we rely on PGSS_PLAN being 0 and PGSS_EXEC being 1. */
 		for (int kind = 0; kind < PGSS_NUMKIND; kind++)
@@ -2228,7 +2232,8 @@ entry_alloc(pgssHashKey *key, Size query_offset, int query_len, int encoding,
 
 		/* reset the statistics */
 		memset(&entry->counters, 0, sizeof(Counters));
-        entry->counters.calls_initiated = 0;
+		/* Initialize calls_initiated to 1 since ExecutorStart was already called */
+		entry->counters.calls_initiated = 1;
 		/* set the appropriate initial usage count */
 		entry->counters.usage = sticky ? pgss->cur_median_usage : USAGE_INIT;
 		/* re-initialize the mutex each time ... we assume no one using it */
@@ -2302,9 +2307,16 @@ entry_dealloc(void)
 		entries[i++] = entry;
 		/* "Sticky" entries get a different usage decay rate. */
 		if (IS_STICKY(entry->counters))
+		{
 			entry->counters.usage *= STICKY_DECREASE_FACTOR;
+		}
 		else
 			entry->counters.usage *= USAGE_DECREASE_FACTOR;
+
+		/* Boost usage for timeout tracking entries to prevent eviction - TO Remove ? */
+		if (entry->counters.calls_initiated > 0)
+			entry->counters.usage = Max(entry->counters.usage, 1000.0);
+
 		/* In the mean length computation, ignore dropped texts. */
 		if (entry->query_len >= 0)
 		{
@@ -2329,8 +2341,12 @@ entry_dealloc(void)
 	nvictims = Max(10, i * USAGE_DEALLOC_PERCENT / 100);
 	nvictims = Min(nvictims, i);
 
+	elog(INFO, "BENOIT DEBUG: entry_dealloc removing %d entries out of %d total", nvictims, i);
+
 	for (i = 0; i < nvictims; i++)
 	{
+		elog(INFO, "BENOIT DEBUG: Removing entry with queryId %lld, usage=%f, calls_initiated=%lld",
+			 (long long)entries[i]->key.queryid, entries[i]->counters.usage, entries[i]->counters.calls_initiated);
 		hash_search(pgss_hash, &entries[i]->key, HASH_REMOVE, NULL);
 	}
 
