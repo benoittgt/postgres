@@ -38,6 +38,8 @@ $PG_TEST_DIR/bin/psql -p 5433 test -c "ALTER DATABASE test SET statement_timeout
 $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "ALTER DATABASE test SET statement_timeout = '500ms';"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_sleep(1) FROM test_table;" # We want to test that we can create a new entry
 
 $PG_TEST_DIR/bin/psql -p 5433 -P pager=off test -c "
 -- Check pg_stat_statements
