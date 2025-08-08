@@ -95,7 +95,7 @@ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
 #define STICKY_DECREASE_FACTOR	(0.50)	/* factor for sticky entries */
 #define USAGE_DEALLOC_PERCENT	5	/* free this % of entries at once */
-#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC]) == 0)
+#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC] + c.calls_aborted) == 0)
 
 /*
  * Extension version number, for supporting older extension versions' objects
@@ -153,7 +153,7 @@ typedef struct Counters
 {
 	int64		calls[PGSS_NUMKIND];	/* # of times planned/executed */
 
-	int64       calls_aborted;              /* # of times query was aborted */
+	int64       calls_aborted;          /* # of times query was aborted */
 
 	double		total_time[PGSS_NUMKIND];	/* total planning/execution time,
 											 * in msec */
@@ -1044,22 +1044,26 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 	PG_FINALLY();
 	{
 		/* If query didn't complete, it was aborted (timeout/cancel) */
-		if (!query_completed && pgss && queryDesc->plannedstmt->queryId != UINT64CONST(0))
+		if (!query_completed && pgss && pgss_enabled(nesting_level) &&
+			queryDesc->plannedstmt->queryId != UINT64CONST(0))
 		{
 			pgssHashKey key;
 			pgssEntry *entry;
-			bool found;
 
 			/* Clear padding to ensure proper hash key comparison */
 			memset(&key, 0, sizeof(pgssHashKey));
+
 			key.userid = GetUserId();
 			key.dbid = MyDatabaseId;
-			key.toplevel = ((nesting_level - 1) == 0); /* Match pgss_store logic */
+			/* nesting_level was incremented at start of ExecutorRun */
+			key.toplevel = (nesting_level == 1);
 			key.queryid = queryDesc->plannedstmt->queryId;
 
-			/* Find existing entry or create new one for this aborted query */
 			LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
-			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, &found);
+
+			/* Entry should exist from pgss_post_parse_analyze, even for first-time failures */
+			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
+
 			if (entry)
 			{
 				SpinLockAcquire(&entry->mutex);
