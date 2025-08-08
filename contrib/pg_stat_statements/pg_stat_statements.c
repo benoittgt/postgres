@@ -1579,7 +1579,7 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
  * expected API version is identified by embedding it in the C name of the
  * function.  Unfortunately we weren't bright enough to do that for 1.1.
  */
- Datum
+Datum
 pg_stat_statements_1_13(PG_FUNCTION_ARGS)
 {
 	bool		showtext = PG_GETARG_BOOL(0);
@@ -1909,6 +1909,13 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			if (kind == PGSS_EXEC || api_version >= PGSS_V1_8)
 			{
 				values[i++] = Int64GetDatumFast(tmp.calls[kind]);
+
+				/* Add calls_aborted right after execution calls */
+				if (kind == PGSS_EXEC && api_version >= PGSS_V1_13)
+				{
+					values[i++] = Int64GetDatumFast(tmp.calls_aborted);
+				}
+
 				values[i++] = Float8GetDatumFast(tmp.total_time[kind]);
 			}
 

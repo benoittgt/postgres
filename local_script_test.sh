@@ -46,7 +46,7 @@ $PG_TEST_DIR/bin/psql -p 5433 -P pager=off test -c "
 -- Check pg_stat_statements
 SELECT query,
        calls,
-       calls_initiated,
+       calls_aborted,
        total_exec_time,
        mean_exec_time,
        rows,
@@ -56,7 +56,6 @@ SELECT query,
        temp_blks_written
 FROM pg_stat_statements
 WHERE query NOT LIKE '%pg_stat_statements%'
-ORDER BY calls_initiated DESC
 LIMIT 5;
 "
 
