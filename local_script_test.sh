@@ -30,17 +30,13 @@ $PG_TEST_DIR/bin/psql -p 5433 test -c "CREATE TABLE test_table (
     data text
 );"
 $PG_TEST_DIR/bin/psql -p 5433 test -c "INSERT INTO test_table (data) SELECT 'data_' || generate_series(1,1000);"
-$PG_TEST_DIR/bin/psql -p 5433 test -c "SET statement_timeout = '1s';
-
-SELECT pg_stat_statements_reset();
-
--- Two working queries
-SELECT count(*) FROM test_table;
-SELECT data FROM test_table WHERE id = 42;
-
--- One query that will timeout
-SELECT pg_sleep(2), count(*) FROM test_table;
-"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SET statement_timeout = '1s';"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_stat_statements_reset();"
+# $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT count(*) FROM test_table;"
+# $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT data FROM test_table WHERE id = 42;"
+# Now run the query that will timeout
+echo "💀 Running query that will timeout..."
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SET statement_timeout = '1s'; SELECT pg_sleep(2), count(*) FROM test_table;"
 
 $PG_TEST_DIR/bin/psql -p 5433 -P pager=off test -c "
 -- Check pg_stat_statements
