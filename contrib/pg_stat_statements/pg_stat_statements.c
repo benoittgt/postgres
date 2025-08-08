@@ -994,6 +994,12 @@ pgss_planner(Query *parse,
 static void
 pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	elog(INFO, "benoit: ExecutorStart called for query: %s", queryDesc->sourceText);
+	elog(INFO, "benoit: ExecutorStart queryId=" UINT64_FORMAT ", nesting_level=%d, pgss_enabled=%d",
+		 queryDesc->plannedstmt ? queryDesc->plannedstmt->queryId : 0,
+		 nesting_level,
+		 pgss_enabled(nesting_level) ? 1 : 0);
+		 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
@@ -1028,6 +1034,8 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
+	bool query_completed = false;
+
 	nesting_level++;
 	PG_TRY();
 	{
@@ -1051,17 +1059,28 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 			/* Very basic approach: find entry and increment calls_aborted */
 			if (pgss && queryDesc->plannedstmt->queryId != UINT64CONST(0))
 			{
-				elog(INFO, "benoit: detected aborted query, incrementing calls_aborted");
 				pgssHashKey key;
 				pgssEntry *entry;
 
+				elog(INFO, "benoit: detected aborted query, incrementing calls_aborted");
+
+				/* clear padding */
+				memset(&key, 0, sizeof(pgssHashKey));
+				
 				key.userid = GetUserId();
 				key.dbid = MyDatabaseId;
 				key.toplevel = (nesting_level == 1); /* we incremented nesting_level above */
 				key.queryid = queryDesc->plannedstmt->queryId;
 
+				elog(INFO, "benoit: looking for entry with userid=%u, dbid=%u, toplevel=%d, queryid=" UINT64_FORMAT,
+					 key.userid, key.dbid, key.toplevel, key.queryid);
+
 				LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
-				entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
+				
+				/* Use HASH_ENTER to find existing or create new entry */
+				bool found;
+				entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_ENTER, &found);
+				elog(INFO, "benoit: hash_search HASH_ENTER returned %p, found=%d", entry, found);
 				if (entry)
 				{
 					SpinLockAcquire(&entry->mutex);
@@ -1072,8 +1091,71 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 				else
 				{
 					elog(INFO, "benoit: no entry found for aborted query");
+
+					/* Let's try with different toplevel values to debug */
+					key.toplevel = !key.toplevel;
+					elog(INFO, "benoit: trying with toplevel=%d", key.toplevel);
+					entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
+					if (entry)
+					{
+						elog(INFO, "benoit: found entry with different toplevel!");
+						SpinLockAcquire(&entry->mutex);
+						entry->counters.calls_aborted++;
+						SpinLockRelease(&entry->mutex);
+						elog(INFO, "benoit: calls_aborted incremented to " INT64_FORMAT, entry->counters.calls_aborted);
+					}
+					else
+					{
+						elog(INFO, "benoit: still no entry found even with different toplevel");
+						
+						/* Let's inspect the hash table to see what entries exist */
+						HASH_SEQ_STATUS hash_seq;
+						pgssEntry *entry_iter;
+						int entry_count = 0;
+						
+						elog(INFO, "benoit: inspecting hash table contents...");
+						hash_seq_init(&hash_seq, pgss_hash);
+						while ((entry_iter = hash_seq_search(&hash_seq)) != NULL)
+						{
+							entry_count++;
+							elog(INFO, "benoit: found entry %d: userid=%u, dbid=%u, toplevel=%d, queryid=" UINT64_FORMAT,
+								 entry_count,
+								 entry_iter->key.userid,
+								 entry_iter->key.dbid, 
+								 entry_iter->key.toplevel ? 1 : 0,
+								 entry_iter->key.queryid);
+								 
+							/* Show query text for first few entries to understand what's there */
+							if (entry_count <= 3)
+							{
+								char *query_text = (char *) ((char *) entry_iter + entry_iter->query_offset);
+								elog(INFO, "benoit: entry %d query text: %.60s", entry_count, query_text);
+							}
+								 
+							/* Only show first 5 entries to avoid log spam */
+							if (entry_count >= 5) {
+								elog(INFO, "benoit: (showing only first 5 entries)");
+								break;
+							}
+						}
+						hash_seq_term(&hash_seq);
+						
+						if (entry_count == 0)
+						{
+							elog(INFO, "benoit: hash table is empty! No entries at all.");
+						}
+						else
+						{
+							elog(INFO, "benoit: hash table has %d entries, but none match our key", entry_count);
+						}
+					}
 				}
 				LWLockRelease(pgss->lock);
+			}
+			else
+			{
+				elog(INFO, "benoit: pgss=%p, queryId=" UINT64_FORMAT, pgss,
+					 queryDesc->plannedstmt ? queryDesc->plannedstmt->queryId : 0);
 			}
 		}
 
