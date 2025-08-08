@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 # PostgreSQL build script with pg_stat_statements
 #
 # Usage:

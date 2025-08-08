@@ -1035,15 +1035,51 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 			prev_ExecutorRun(queryDesc, direction, count);
 		else
 			standard_ExecutorRun(queryDesc, direction, count);
+
+		/* Mark as completed if we reach here */
+		query_completed = true;
 	}
-    PG_CATCH();
+	PG_FINALLY();
 	{
-        elog(INFO, "benoit: query failed (timeout/cancel): %s", queryDesc->sourceText);
+		elog(INFO, "benoit: query finished PG_FINALLY: %s, query_completed: %d", queryDesc->sourceText, query_completed);
+
+		/* If query didn't complete, it was aborted (timeout/cancel) */
+		if (!query_completed)
+		{
+			elog(INFO, "benoit: query was aborted, trying to increment calls_aborted");
+
+			/* Very basic approach: find entry and increment calls_aborted */
+			if (pgss && queryDesc->plannedstmt->queryId != UINT64CONST(0))
+			{
+				elog(INFO, "benoit: detected aborted query, incrementing calls_aborted");
+				pgssHashKey key;
+				pgssEntry *entry;
+
+				key.userid = GetUserId();
+				key.dbid = MyDatabaseId;
+				key.toplevel = (nesting_level == 1); /* we incremented nesting_level above */
+				key.queryid = queryDesc->plannedstmt->queryId;
+
+				LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
+				entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
+				if (entry)
+				{
+					SpinLockAcquire(&entry->mutex);
+					entry->counters.calls_aborted++;
+					SpinLockRelease(&entry->mutex);
+					elog(INFO, "benoit: calls_aborted incremented to " INT64_FORMAT, entry->counters.calls_aborted);
+				}
+				else
+				{
+					elog(INFO, "benoit: no entry found for aborted query");
+				}
+				LWLockRelease(pgss->lock);
+			}
+		}
+
 		nesting_level--;
-        PG_RE_THROW();
 	}
 	PG_END_TRY();
-    nesting_level--;
 }
 
 /*

@@ -36,7 +36,8 @@ $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_stat_statements_reset();"
 # $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT data FROM test_table WHERE id = 42;"
 # Now run the query that will timeout
 echo "💀 Running query that will timeout..."
-$PG_TEST_DIR/bin/psql -p 5433 test -c "SET statement_timeout = '1s'; SELECT pg_sleep(2), count(*) FROM test_table;"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
+$PG_TEST_DIR/bin/psql -p 5433 test -c "SET statement_timeout = '0.5s'; SELECT pg_sleep(1), count(*) FROM test_table;"
 
 $PG_TEST_DIR/bin/psql -p 5433 -P pager=off test -c "
 -- Check pg_stat_statements
