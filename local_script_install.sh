@@ -98,6 +98,7 @@ else
 
     echo "🦀 Building PostgreSQL in $PG_TEST_DIR"
     make
+    make install
 
     echo "🦀 Building contrib modules in $PG_TEST_DIR"
     cd contrib/pg_stat_statements
