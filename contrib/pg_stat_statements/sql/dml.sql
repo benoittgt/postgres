@@ -93,3 +93,13 @@ SELECT
 FROM pg_stat_statements;
 
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+
+-- aborted calls tracking
+SELECT pg_sleep(0.1);
+SET statement_timeout = '50ms';
+SELECT pg_sleep(0.1);
+SELECT pg_sleep(0.1), 'test';
+SET statement_timeout = '0';
+
+SELECT query, calls, calls_aborted FROM pg_stat_statements
+WHERE query LIKE '%pg_sleep%' ORDER BY query COLLATE "C";
