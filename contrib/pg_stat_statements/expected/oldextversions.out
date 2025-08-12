@@ -425,6 +425,7 @@ AlTER EXTENSION pg_stat_statements UPDATE TO '1.13';
  mean_plan_time             | double precision         |           |          | 
  stddev_plan_time           | double precision         |           |          | 
  calls                      | bigint                   |           |          | 
+ calls_aborted              | bigint                   |           |          | 
  total_exec_time            | double precision         |           |          | 
  min_exec_time              | double precision         |           |          | 
  max_exec_time              | double precision         |           |          | 
