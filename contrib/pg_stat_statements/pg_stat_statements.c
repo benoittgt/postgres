@@ -1069,7 +1069,9 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 
 			LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
 
-			/* Entry should exist from pgss_post_parse_analyze, even for first-time failures */
+			/* Only increment calls_aborted if entry already exists.
+			* Entries are created in pgss_post_parse_analyze for queries with constants.
+			* If no entry exists, the query wouldn't normally be tracked anyway. */
 			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
 
 			if (entry)
