@@ -1051,8 +1051,16 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 	}
 	PG_FINALLY();
 	{
-		/* If query didn't complete, it was aborted (timeout/cancel) */
-		if (!query_completed && pgss && pgss_enabled(nesting_level) &&
+		/*
+		 * Check if tracking was enabled when ExecutorRun started.
+		 * We use (nesting_level - 1) because nesting_level was incremented
+		 * at the start of this function, but the tracking decision should
+		 * be based on the level when the query began execution.
+		 * This is crucial for PGSS_TRACK_TOP mode to work correctly.
+		 */
+		bool was_enabled = pgss_enabled(nesting_level - 1);
+
+		if (!query_completed && pgss && was_enabled &&
 			queryDesc->plannedstmt->queryId != UINT64CONST(0))
 		{
 			pgssHashKey key;
