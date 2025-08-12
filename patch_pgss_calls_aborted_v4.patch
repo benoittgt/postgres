@@ -1,0 +1,181 @@
+diff --git a/contrib/pg_stat_statements/expected/dml.out b/contrib/pg_stat_statements/expected/dml.out
+index 347cb8699e4..80ae1a5bc06 100644
+--- a/contrib/pg_stat_statements/expected/dml.out
++++ b/contrib/pg_stat_statements/expected/dml.out
+@@ -172,3 +172,24 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+  t
+ (1 row)
+ 
++-- aborted calls tracking
++SELECT pg_sleep(0.5);
++ pg_sleep 
++----------
++ 
++(1 row)
++
++SET statement_timeout = '50ms';
++SELECT pg_sleep(0.5);
++ERROR:  canceling statement due to statement timeout
++SELECT pg_sleep(0.5), 'test';
++ERROR:  canceling statement due to statement timeout
++SET statement_timeout = '0';
++SELECT query, calls, calls_aborted FROM pg_stat_statements
++WHERE query LIKE '%pg_sleep%' ORDER BY query COLLATE "C";
++          query          | calls | calls_aborted 
++-------------------------+-------+---------------
++ SELECT pg_sleep($1)     |     1 |             1
++ SELECT pg_sleep($1), $2 |     0 |             1
++(2 rows)
++
+diff --git a/contrib/pg_stat_statements/expected/oldextversions.out b/contrib/pg_stat_statements/expected/oldextversions.out
+index 726383a99d7..d5ebb59d5a1 100644
+--- a/contrib/pg_stat_statements/expected/oldextversions.out
++++ b/contrib/pg_stat_statements/expected/oldextversions.out
+@@ -425,6 +425,7 @@ AlTER EXTENSION pg_stat_statements UPDATE TO '1.13';
+  mean_plan_time             | double precision         |           |          | 
+  stddev_plan_time           | double precision         |           |          | 
+  calls                      | bigint                   |           |          | 
++ calls_aborted              | bigint                   |           |          | 
+  total_exec_time            | double precision         |           |          | 
+  min_exec_time              | double precision         |           |          | 
+  max_exec_time              | double precision         |           |          | 
+diff --git a/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql b/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql
+index 2f0eaf14ec3..fe8bcb6398b 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql
++++ b/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql
+@@ -25,6 +25,7 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
+     OUT mean_plan_time float8,
+     OUT stddev_plan_time float8,
+     OUT calls int8,
++    OUT calls_aborted int8,
+     OUT total_exec_time float8,
+     OUT min_exec_time float8,
+     OUT max_exec_time float8,
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.c b/contrib/pg_stat_statements/pg_stat_statements.c
+index 9fc9635d330..61cd1fe6bb7 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.c
++++ b/contrib/pg_stat_statements/pg_stat_statements.c
+@@ -98,7 +98,7 @@ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
+ #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
+ #define STICKY_DECREASE_FACTOR	(0.50)	/* factor for sticky entries */
+ #define USAGE_DEALLOC_PERCENT	5	/* free this % of entries at once */
+-#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC]) == 0)
++#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC] + c.calls_aborted) == 0)
+ 
+ /*
+  * Extension version number, for supporting older extension versions' objects
+@@ -155,6 +155,9 @@ typedef struct pgssHashKey
+ typedef struct Counters
+ {
+ 	int64		calls[PGSS_NUMKIND];	/* # of times planned/executed */
++
++	int64       calls_aborted;          /* # of times query was aborted */
++
+ 	double		total_time[PGSS_NUMKIND];	/* total planning/execution time,
+ 											 * in msec */
+ 	double		min_time[PGSS_NUMKIND]; /* minimum planning/execution time in
+@@ -1033,6 +1036,8 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
+ static void
+ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+ {
++	volatile bool query_completed = false;
++
+ 	nesting_level++;
+ 	PG_TRY();
+ 	{
+@@ -1040,9 +1045,52 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+ 			prev_ExecutorRun(queryDesc, direction, count);
+ 		else
+ 			standard_ExecutorRun(queryDesc, direction, count);
++
++		/* Mark as completed if we reach here */
++		query_completed = true;
+ 	}
+ 	PG_FINALLY();
+ 	{
++		/*
++		 * Check if tracking was enabled when ExecutorRun started.
++		 * We use (nesting_level - 1) because nesting_level was incremented
++		 * at the start of this function, but the tracking decision should
++		 * be based on the level when the query began execution.
++		 * This is crucial for PGSS_TRACK_TOP mode to work correctly.
++		 */
++		bool was_enabled = pgss_enabled(nesting_level - 1);
++
++		if (!query_completed && pgss && was_enabled &&
++			queryDesc->plannedstmt->queryId != UINT64CONST(0))
++		{
++			pgssHashKey key;
++			pgssEntry *entry;
++
++			/* Clear padding to ensure proper hash key comparison */
++			memset(&key, 0, sizeof(pgssHashKey));
++
++			key.userid = GetUserId();
++			key.dbid = MyDatabaseId;
++			/* nesting_level was incremented at start of ExecutorRun */
++			key.toplevel = (nesting_level == 1);
++			key.queryid = queryDesc->plannedstmt->queryId;
++
++			LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
++
++			/* Only increment calls_aborted if entry already exists.
++			* Entries are created in pgss_post_parse_analyze for queries with constants.
++			* If no entry exists, the query wouldn't normally be tracked anyway. */
++			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
++
++			if (entry)
++			{
++				SpinLockAcquire(&entry->mutex);
++				entry->counters.calls_aborted++;
++				SpinLockRelease(&entry->mutex);
++			}
++			LWLockRelease(pgss->lock);
++		}
++
+ 		nesting_level--;
+ 	}
+ 	PG_END_TRY();
+@@ -1578,8 +1626,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
+ #define PG_STAT_STATEMENTS_COLS_V1_10	43
+ #define PG_STAT_STATEMENTS_COLS_V1_11	49
+ #define PG_STAT_STATEMENTS_COLS_V1_12	52
+-#define PG_STAT_STATEMENTS_COLS_V1_13	54
+-#define PG_STAT_STATEMENTS_COLS			54	/* maximum of above */
++#define PG_STAT_STATEMENTS_COLS_V1_13	55
++#define PG_STAT_STATEMENTS_COLS			55	/* maximum of above */
+ 
+ /*
+  * Retrieve statement statistics.
+@@ -1922,6 +1970,13 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 			if (kind == PGSS_EXEC || api_version >= PGSS_V1_8)
+ 			{
+ 				values[i++] = Int64GetDatumFast(tmp.calls[kind]);
++
++				/* Add calls_aborted right after execution calls */
++				if (kind == PGSS_EXEC && api_version >= PGSS_V1_13)
++				{
++					values[i++] = Int64GetDatumFast(tmp.calls_aborted);
++				}
++
+ 				values[i++] = Float8GetDatumFast(tmp.total_time[kind]);
+ 			}
+ 
+diff --git a/contrib/pg_stat_statements/sql/dml.sql b/contrib/pg_stat_statements/sql/dml.sql
+index 9986b0a22d3..199f018ebc3 100644
+--- a/contrib/pg_stat_statements/sql/dml.sql
++++ b/contrib/pg_stat_statements/sql/dml.sql
+@@ -93,3 +93,13 @@ SELECT
+ FROM pg_stat_statements;
+ 
+ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
++
++-- aborted calls tracking
++SELECT pg_sleep(0.5);
++SET statement_timeout = '50ms';
++SELECT pg_sleep(0.5);
++SELECT pg_sleep(0.5), 'test';
++SET statement_timeout = '0';
++
++SELECT query, calls, calls_aborted FROM pg_stat_statements
++WHERE query LIKE '%pg_sleep%' ORDER BY query COLLATE "C";
