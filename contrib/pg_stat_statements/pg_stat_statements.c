@@ -1036,7 +1036,7 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
-	bool query_completed = false;
+	volatile bool query_completed = false;
 
 	nesting_level++;
 	PG_TRY();
