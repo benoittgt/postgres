@@ -48,6 +48,7 @@
 #include <unistd.h>
 
 #include "access/parallel.h"
+#include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "common/int.h"
 #include "executor/instrument.h"
@@ -277,6 +278,32 @@ static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
+/* Transaction callback functions */
+static void pgss_xact_callback(XactEvent event, void *arg);
+static void pgss_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+								  SubTransactionId parentSubid, void *arg);
+
+/*
+ * Backend-local tracking of the currently running statement.
+ *
+ * We record the hash key used by pg_stat_statements for the statement that
+ * has begun execution, and whether it completed successfully. If a
+ * transaction or subtransaction abort happens while a statement is marked as
+ * active but not completed, we count it as an aborted call in the callbacks.
+ */
+typedef struct pgssLocalCurrentStmt
+{
+	bool        active;         /* true if we've started tracking a stmt */
+	bool        completed;      /* true if the tracked stmt finished OK */
+	pgssHashKey key;            /* identity of the tracked stmt */
+} pgssLocalCurrentStmt;
+
+/* One instance per backend. Zero-initialized at backend start. */
+static pgssLocalCurrentStmt pgss_curr_stmt = {false, false, {0}};
+
+/* helper to increment calls_aborted for the current active statement */
+static void pgss_count_current_as_aborted(void);
+
 /* Links to shared memory state */
 static pgssSharedState *pgss = NULL;
 static HTAB *pgss_hash = NULL;
@@ -493,6 +520,10 @@ _PG_init(void)
 	ExecutorEnd_hook = pgss_ExecutorEnd;
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = pgss_ProcessUtility;
+
+	/* Register transaction callbacks for tracking aborted queries */
+	RegisterXactCallback(pgss_xact_callback, NULL);
+	RegisterSubXactCallback(pgss_subxact_callback, NULL);
 }
 
 /*
@@ -1038,6 +1069,19 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
 	volatile bool query_completed = false;
 
+	/* Start tracking this statement for abort accounting if eligible. */
+	if (pgss && pgss_hash && queryDesc->plannedstmt->queryId != INT64CONST(0)
+		&& pgss_enabled(nesting_level))
+	{
+		memset(&pgss_curr_stmt.key, 0, sizeof(pgss_curr_stmt.key));
+		pgss_curr_stmt.key.userid = GetUserId();
+		pgss_curr_stmt.key.dbid = MyDatabaseId;
+		pgss_curr_stmt.key.queryid = queryDesc->plannedstmt->queryId;
+		pgss_curr_stmt.key.toplevel = (nesting_level == 0);
+		pgss_curr_stmt.active = true;
+		pgss_curr_stmt.completed = false;
+	}
+
 	nesting_level++;
 	PG_TRY();
 	{
@@ -1051,46 +1095,8 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 	}
 	PG_FINALLY();
 	{
-		/*
-		 * Check if tracking was enabled when ExecutorRun started.
-		 * We use (nesting_level - 1) because nesting_level was incremented
-		 * at the start of this function, but the tracking decision should
-		 * be based on the level when the query began execution.
-		 * This is crucial for PGSS_TRACK_TOP mode to work correctly.
-		 */
-		bool was_enabled = pgss_enabled(nesting_level - 1);
-
-		if (!query_completed && pgss && was_enabled &&
-			queryDesc->plannedstmt->queryId != UINT64CONST(0))
-		{
-			pgssHashKey key;
-			pgssEntry *entry;
-
-			/* Clear padding to ensure proper hash key comparison */
-			memset(&key, 0, sizeof(pgssHashKey));
-
-			key.userid = GetUserId();
-			key.dbid = MyDatabaseId;
-			/* nesting_level was incremented at start of ExecutorRun */
-			key.toplevel = (nesting_level == 1);
-			key.queryid = queryDesc->plannedstmt->queryId;
-
-			LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
-
-			/* Only increment calls_aborted if entry already exists.
-			* Entries are created in pgss_post_parse_analyze for queries with constants.
-			* If no entry exists, the query wouldn't normally be tracked anyway. */
-			entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
-
-			if (entry)
-			{
-				SpinLockAcquire(&entry->mutex);
-				entry->counters.calls_aborted++;
-				SpinLockRelease(&entry->mutex);
-			}
-			LWLockRelease(pgss->lock);
-		}
-
+		if (pgss_curr_stmt.active)
+			pgss_curr_stmt.completed = query_completed;
 		nesting_level--;
 	}
 	PG_END_TRY();
@@ -1149,6 +1155,10 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 				   queryDesc->estate->es_parallel_workers_launched,
 				   queryDesc->plannedstmt->planOrigin);
 	}
+
+		/* Clear local tracking for this statement at ExecutorEnd. */
+		pgss_curr_stmt.active = false;
+		pgss_curr_stmt.completed = false;
 
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
@@ -1321,6 +1331,70 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		}
 		PG_END_TRY();
 	}
+}
+
+/*
+ * Transaction callback: report when queries are aborted due to transaction rollback
+ *
+ */
+static void
+pgss_xact_callback(XactEvent event, void *arg)
+{
+	/* We only care about transaction abort events for now */
+	if (event == XACT_EVENT_ABORT)
+		pgss_count_current_as_aborted();
+}
+
+/*
+ * Subtransaction callback: log when queries are aborted due to savepoint rollback
+ *
+ * Parameters:
+ * - event: The subtransaction event that occurred
+ * - mySubid: The ID of the subtransaction being processed  
+ * - parentSubid: The ID of the parent (sub)transaction
+ * - arg: User data passed during registration (NULL in our case)
+ */
+static void
+pgss_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					  SubTransactionId parentSubid, void *arg)
+{
+	/* We only care about subtransaction abort events for now */
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		pgss_count_current_as_aborted();
+}
+
+/*
+ * Increment calls_aborted for the currently tracked statement, if any.
+ * Safe to call even if module is disabled or the statement key isn't valid.
+ */
+static void
+pgss_count_current_as_aborted(void)
+{
+	pgssEntry  *entry;
+
+	/* Fast-path checks */
+	if (!pgss || !pgss_hash)
+		return;
+
+	/* Only if we have a statement that started but did not complete */
+	if (!pgss_curr_stmt.active || pgss_curr_stmt.completed)
+		return;
+
+	/* Acquire lock and try to find the entry. Don't create new entries. */
+	LWLockAcquire(pgss->lock, LW_SHARED);
+	entry = (pgssEntry *) hash_search(pgss_hash, &pgss_curr_stmt.key,
+									  HASH_FIND, NULL);
+	if (entry)
+	{
+		SpinLockAcquire(&entry->mutex);
+		entry->counters.calls_aborted++;
+		SpinLockRelease(&entry->mutex);
+	}
+	LWLockRelease(pgss->lock);
+
+	/* Avoid double-counting on multiple abort-phase callbacks. */
+	pgss_curr_stmt.active = false;
+	pgss_curr_stmt.completed = false;
 }
 
 /*
