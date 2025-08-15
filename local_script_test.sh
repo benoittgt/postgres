@@ -28,22 +28,13 @@ echo "Skipping pg_reload_conf() due to verbose logging - restart will pick up ch
 
 $PG_TEST_DIR/bin/psql test -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';"
 
-$PG_TEST_DIR/bin/psql test -c "DROP TABLE IF EXISTS test_table;"
-echo "🦀 Creating test_table in test database..."
-$PG_TEST_DIR/bin/psql test -c "CREATE TABLE test_table (
-    id serial PRIMARY KEY,
-    data text
-);"
-$PG_TEST_DIR/bin/psql test -c "INSERT INTO test_table (data) SELECT 'data_' || generate_series(1,1000);"
 $PG_TEST_DIR/bin/psql test -c "SELECT pg_stat_statements_reset();"
-# $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT count(*) FROM test_table;"
-# $PG_TEST_DIR/bin/psql -p 5433 test -c "SELECT data FROM test_table WHERE id = 42;"
 # Now run the query that will timeout
 $PG_TEST_DIR/bin/psql test -c "ALTER DATABASE test SET statement_timeout = '2s';"
-$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
-$PG_TEST_DIR/bin/psql test -c "ALTER DATABASE test SET statement_timeout = '500ms';"
-$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
-$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), count(*) FROM test_table;"
+$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(0.01), 'test';"
+$PG_TEST_DIR/bin/psql test -c "ALTER DATABASE test SET statement_timeout = '1ms';"
+$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), 'test';"
+$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), 'test';"
 $PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1);" # We want to test that we can have only calls_aborted at 1 but calls at 0
 
 $PG_TEST_DIR/bin/psql -P pager=off test -c "
