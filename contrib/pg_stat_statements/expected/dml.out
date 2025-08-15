@@ -173,23 +173,23 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 (1 row)
 
 -- aborted calls tracking
-SELECT pg_sleep(0.5);
- pg_sleep 
-----------
- 
-(1 row)
-
-SET statement_timeout = '50ms';
-SELECT pg_sleep(0.5);
-ERROR:  canceling statement due to statement timeout
-SELECT pg_sleep(0.5), 'test';
-ERROR:  canceling statement due to statement timeout
-SET statement_timeout = '0';
+DROP TABLE IF EXISTS t_dup, t_check;
+NOTICE:  table "t_dup" does not exist, skipping
+NOTICE:  table "t_check" does not exist, skipping
+CREATE TABLE t_dup(id int primary key);
+INSERT INTO t_dup VALUES (1); -- success
+CREATE TABLE t_check(x int CHECK (x > 0));
+INSERT INTO t_dup VALUES (1); -- unique violation, aborted and success reported
+ERROR:  duplicate key value violates unique constraint "t_dup_pkey"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO t_check VALUES (0); -- check violation, only failure reported
+ERROR:  new row for relation "t_check" violates check constraint "t_check_x_check"
+DETAIL:  Failing row contains (0).
 SELECT query, calls, calls_aborted FROM pg_stat_statements
-WHERE query LIKE '%pg_sleep%' ORDER BY query COLLATE "C";
-          query          | calls | calls_aborted 
--------------------------+-------+---------------
- SELECT pg_sleep($1)     |     1 |             1
- SELECT pg_sleep($1), $2 |     0 |             1
+WHERE query LIKE '%INSERT INTO t_%' ORDER BY query COLLATE "C";
+              query              | calls | calls_aborted 
+---------------------------------+-------+---------------
+ INSERT INTO t_check VALUES ($1) |     0 |             1
+ INSERT INTO t_dup VALUES ($1)   |     1 |             1
 (2 rows)
 

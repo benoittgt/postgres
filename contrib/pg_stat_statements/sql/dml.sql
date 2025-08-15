@@ -95,11 +95,13 @@ FROM pg_stat_statements;
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- aborted calls tracking
-SELECT pg_sleep(0.5);
-SET statement_timeout = '50ms';
-SELECT pg_sleep(0.5);
-SELECT pg_sleep(0.5), 'test';
-SET statement_timeout = '0';
+DROP TABLE IF EXISTS t_dup, t_check;
+CREATE TABLE t_dup(id int primary key);
+INSERT INTO t_dup VALUES (1); -- success
+CREATE TABLE t_check(x int CHECK (x > 0));
+INSERT INTO t_dup VALUES (1); -- unique violation, aborted and success reported
+INSERT INTO t_check VALUES (0); -- check violation, only failure reported
 
 SELECT query, calls, calls_aborted FROM pg_stat_statements
-WHERE query LIKE '%pg_sleep%' ORDER BY query COLLATE "C";
+WHERE query LIKE '%INSERT INTO t_%' ORDER BY query COLLATE "C";
+
