@@ -1,0 +1,284 @@
+diff --git a/contrib/pg_stat_statements/expected/dml.out b/contrib/pg_stat_statements/expected/dml.out
+index 347cb8699e4..ac5886b250f 100644
+--- a/contrib/pg_stat_statements/expected/dml.out
++++ b/contrib/pg_stat_statements/expected/dml.out
+@@ -172,3 +172,24 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+  t
+ (1 row)
+ 
++-- aborted calls tracking
++DROP TABLE IF EXISTS t_dup, t_check;
++NOTICE:  table "t_dup" does not exist, skipping
++NOTICE:  table "t_check" does not exist, skipping
++CREATE TABLE t_dup(id int primary key);
++INSERT INTO t_dup VALUES (1); -- success
++CREATE TABLE t_check(x int CHECK (x > 0));
++INSERT INTO t_dup VALUES (1); -- unique violation, aborted and success reported
++ERROR:  duplicate key value violates unique constraint "t_dup_pkey"
++DETAIL:  Key (id)=(1) already exists.
++INSERT INTO t_check VALUES (0); -- check violation, only failure reported
++ERROR:  new row for relation "t_check" violates check constraint "t_check_x_check"
++DETAIL:  Failing row contains (0).
++SELECT query, calls, calls_aborted FROM pg_stat_statements
++WHERE query LIKE '%INSERT INTO t_%' ORDER BY query COLLATE "C";
++              query              | calls | calls_aborted 
++---------------------------------+-------+---------------
++ INSERT INTO t_check VALUES ($1) |     0 |             1
++ INSERT INTO t_dup VALUES ($1)   |     1 |             1
++(2 rows)
++
+diff --git a/contrib/pg_stat_statements/expected/oldextversions.out b/contrib/pg_stat_statements/expected/oldextversions.out
+index 726383a99d7..d5ebb59d5a1 100644
+--- a/contrib/pg_stat_statements/expected/oldextversions.out
++++ b/contrib/pg_stat_statements/expected/oldextversions.out
+@@ -425,6 +425,7 @@ AlTER EXTENSION pg_stat_statements UPDATE TO '1.13';
+  mean_plan_time             | double precision         |           |          | 
+  stddev_plan_time           | double precision         |           |          | 
+  calls                      | bigint                   |           |          | 
++ calls_aborted              | bigint                   |           |          | 
+  total_exec_time            | double precision         |           |          | 
+  min_exec_time              | double precision         |           |          | 
+  max_exec_time              | double precision         |           |          | 
+diff --git a/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql b/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql
+index 2f0eaf14ec3..fe8bcb6398b 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql
++++ b/contrib/pg_stat_statements/pg_stat_statements--1.12--1.13.sql
+@@ -25,6 +25,7 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
+     OUT mean_plan_time float8,
+     OUT stddev_plan_time float8,
+     OUT calls int8,
++    OUT calls_aborted int8,
+     OUT total_exec_time float8,
+     OUT min_exec_time float8,
+     OUT max_exec_time float8,
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.c b/contrib/pg_stat_statements/pg_stat_statements.c
+index 9fc9635d330..912e85c9d37 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.c
++++ b/contrib/pg_stat_statements/pg_stat_statements.c
+@@ -48,6 +48,7 @@
+ #include <unistd.h>
+ 
+ #include "access/parallel.h"
++#include "access/xact.h"
+ #include "catalog/pg_authid.h"
+ #include "common/int.h"
+ #include "executor/instrument.h"
+@@ -98,7 +99,7 @@ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
+ #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
+ #define STICKY_DECREASE_FACTOR	(0.50)	/* factor for sticky entries */
+ #define USAGE_DEALLOC_PERCENT	5	/* free this % of entries at once */
+-#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC]) == 0)
++#define IS_STICKY(c)	((c.calls[PGSS_PLAN] + c.calls[PGSS_EXEC] + c.calls_aborted) == 0)
+ 
+ /*
+  * Extension version number, for supporting older extension versions' objects
+@@ -155,6 +156,9 @@ typedef struct pgssHashKey
+ typedef struct Counters
+ {
+ 	int64		calls[PGSS_NUMKIND];	/* # of times planned/executed */
++
++	int64       calls_aborted;          /* # of times query was aborted */
++
+ 	double		total_time[PGSS_NUMKIND];	/* total planning/execution time,
+ 											 * in msec */
+ 	double		min_time[PGSS_NUMKIND]; /* minimum planning/execution time in
+@@ -274,6 +278,32 @@ static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+ 
++/* Transaction callback functions */
++static void pgss_xact_callback(XactEvent event, void *arg);
++static void pgss_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
++								  SubTransactionId parentSubid, void *arg);
++
++/*
++ * Backend-local tracking of the currently running statement.
++ *
++ * We record the hash key used by pg_stat_statements for the statement that
++ * has begun execution, and whether it completed successfully. If a
++ * transaction or subtransaction abort happens while a statement is marked as
++ * active but not completed, we count it as an aborted call in the callbacks.
++ */
++typedef struct pgssLocalCurrentStmt
++{
++	bool        active;         /* true if we've started tracking a stmt */
++	bool        completed;      /* true if the tracked stmt finished OK */
++	pgssHashKey key;            /* identity of the tracked stmt */
++} pgssLocalCurrentStmt;
++
++/* One instance per backend. Zero-initialized at backend start. */
++static pgssLocalCurrentStmt pgss_curr_stmt = {false, false, {0}};
++
++/* helper to increment calls_aborted for the current active statement */
++static void pgss_count_current_as_aborted(void);
++
+ /* Links to shared memory state */
+ static pgssSharedState *pgss = NULL;
+ static HTAB *pgss_hash = NULL;
+@@ -490,6 +520,10 @@ _PG_init(void)
+ 	ExecutorEnd_hook = pgss_ExecutorEnd;
+ 	prev_ProcessUtility = ProcessUtility_hook;
+ 	ProcessUtility_hook = pgss_ProcessUtility;
++
++	/* Register transaction callbacks for tracking aborted queries */
++	RegisterXactCallback(pgss_xact_callback, NULL);
++	RegisterSubXactCallback(pgss_subxact_callback, NULL);
+ }
+ 
+ /*
+@@ -1033,6 +1067,21 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
+ static void
+ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+ {
++	volatile bool query_completed = false;
++
+t+	/* Start tracking this statement for abort accounting if eligible. */
++	if (pgss && pgss_hash && queryDesc->plannedstmt->queryId != INT64CONST(0)
++		&& pgss_enabled(nesting_level))
++	{
++		memset(&pgss_curr_stmt.key, 0, sizeof(pgss_curr_stmt.key));
++		pgss_curr_stmt.key.userid = GetUserId();
++		pgss_curr_stmt.key.dbid = MyDatabaseId;
++		pgss_curr_stmt.key.queryid = queryDesc->plannedstmt->queryId;
++		pgss_curr_stmt.key.toplevel = (nesting_level == 0);
++		pgss_curr_stmt.active = true;
++		pgss_curr_stmt.completed = false;
++	}
++
+ 	nesting_level++;
+ 	PG_TRY();
+ 	{
+@@ -1040,9 +1089,14 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+ 			prev_ExecutorRun(queryDesc, direction, count);
+ 		else
+ 			standard_ExecutorRun(queryDesc, direction, count);
++
++		/* Mark as completed if we reach here */
++		query_completed = true;
+ 	}
+ 	PG_FINALLY();
+ 	{
++		if (pgss_curr_stmt.active)
++			pgss_curr_stmt.completed = query_completed;
+ 		nesting_level--;
+ 	}
+ 	PG_END_TRY();
+@@ -1102,6 +1156,10 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
+ 				   queryDesc->plannedstmt->planOrigin);
+ 	}
+ 
++		/* Clear local tracking for this statement at ExecutorEnd. */
++		pgss_curr_stmt.active = false;
++		pgss_curr_stmt.completed = false;
++
+ 	if (prev_ExecutorEnd)
+ 		prev_ExecutorEnd(queryDesc);
+ 	else
+@@ -1275,6 +1333,62 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+ 	}
+ }
+ 
++/*
++ * Transaction callback: report when queries are aborted due to transaction rollback
++ */
++static void
++pgss_xact_callback(XactEvent event, void *arg)
++{
++	/* We only care about transaction abort events for now */
++	if (event == XACT_EVENT_ABORT)
++		pgss_count_current_as_aborted();
++}
++
++/*
++ * Subtransaction callback: log when queries are aborted due to savepoint rollback
++ */
++static void
++pgss_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
++					  SubTransactionId parentSubid, void *arg)
++{
++	/* We only care about subtransaction abort events for now */
++	if (event == SUBXACT_EVENT_ABORT_SUB)
++		pgss_count_current_as_aborted();
++}
++
++/*
++ * Increment calls_aborted for the currently tracked statement
++ */
++static void
++pgss_count_current_as_aborted(void)
++{
++	pgssEntry  *entry;
++
++	/* Fast-path checks */
++	if (!pgss || !pgss_hash)
++		return;
++
++	/* Only if we have a statement that started but did not complete */
++	if (!pgss_curr_stmt.active || pgss_curr_stmt.completed)
++		return;
++
++	/* Acquire lock and try to find the entry. Don't create new entries. */
++	LWLockAcquire(pgss->lock, LW_SHARED);
++	entry = (pgssEntry *) hash_search(pgss_hash, &pgss_curr_stmt.key,
++									  HASH_FIND, NULL);
++	if (entry)
++	{
++		SpinLockAcquire(&entry->mutex);
++		entry->counters.calls_aborted++;
++		SpinLockRelease(&entry->mutex);
++	}
++	LWLockRelease(pgss->lock);
++
++	/* Avoid double-counting on multiple abort-phase callbacks. */
++	pgss_curr_stmt.active = false;
++	pgss_curr_stmt.completed = false;
++}
++
+ /*
+  * Store some statistics for a statement.
+  *
+@@ -1578,8 +1692,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
+ #define PG_STAT_STATEMENTS_COLS_V1_10	43
+ #define PG_STAT_STATEMENTS_COLS_V1_11	49
+ #define PG_STAT_STATEMENTS_COLS_V1_12	52
+-#define PG_STAT_STATEMENTS_COLS_V1_13	54
+-#define PG_STAT_STATEMENTS_COLS			54	/* maximum of above */
++#define PG_STAT_STATEMENTS_COLS_V1_13	55
++#define PG_STAT_STATEMENTS_COLS			55	/* maximum of above */
+ 
+ /*
+  * Retrieve statement statistics.
+@@ -1922,6 +2036,13 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 			if (kind == PGSS_EXEC || api_version >= PGSS_V1_8)
+ 			{
+ 				values[i++] = Int64GetDatumFast(tmp.calls[kind]);
++
++				/* Add calls_aborted right after execution calls */
++				if (kind == PGSS_EXEC && api_version >= PGSS_V1_13)
++				{
++					values[i++] = Int64GetDatumFast(tmp.calls_aborted);
++				}
++
+ 				values[i++] = Float8GetDatumFast(tmp.total_time[kind]);
+ 			}
+ 
+diff --git a/contrib/pg_stat_statements/sql/dml.sql b/contrib/pg_stat_statements/sql/dml.sql
+index 9986b0a22d3..c612eb4cae2 100644
+--- a/contrib/pg_stat_statements/sql/dml.sql
++++ b/contrib/pg_stat_statements/sql/dml.sql
+@@ -93,3 +93,15 @@ SELECT
+ FROM pg_stat_statements;
+ 
+ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
++
++-- aborted calls tracking
++DROP TABLE IF EXISTS t_dup, t_check;
++CREATE TABLE t_dup(id int primary key);
++INSERT INTO t_dup VALUES (1); -- success
++CREATE TABLE t_check(x int CHECK (x > 0));
++INSERT INTO t_dup VALUES (1); -- unique violation, aborted and success reported
++INSERT INTO t_check VALUES (0); -- check violation, only failure reported
++
++SELECT query, calls, calls_aborted FROM pg_stat_statements
++WHERE query LIKE '%INSERT INTO t_%' ORDER BY query COLLATE "C";
++
