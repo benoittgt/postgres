@@ -31,11 +31,20 @@ $PG_TEST_DIR/bin/psql test -c "SELECT extversion FROM pg_extension WHERE extname
 $PG_TEST_DIR/bin/psql test -c "SELECT pg_stat_statements_reset();"
 # Now run the query that will timeout
 $PG_TEST_DIR/bin/psql test -c "ALTER DATABASE test SET statement_timeout = '2s';"
-$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(0.01), 'test';"
+$PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), 'test';"
 $PG_TEST_DIR/bin/psql test -c "ALTER DATABASE test SET statement_timeout = '1ms';"
 $PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), 'test';"
 $PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1), 'test';"
 $PG_TEST_DIR/bin/psql test -c "SELECT pg_sleep(1);" # We want to test that we can have only calls_aborted at 1 but calls at 0
+
+$PG_TEST_DIR/bin/psql test -c "SELECT pg_stat_statements_reset();"
+$PG_TEST_DIR/bin/psql test -c "DROP TABLE IF EXISTS t_dup, t_check;"
+$PG_TEST_DIR/bin/psql test -c "CREATE TABLE t_dup(id int primary key);"
+$PG_TEST_DIR/bin/psql test -c "INSERT INTO t_dup VALUES (1);"
+$PG_TEST_DIR/bin/psql test -c "CREATE TABLE t_check(x int CHECK (x > 0));"
+$PG_TEST_DIR/bin/psql test -c "SELECT 42;" # success entry
+$PG_TEST_DIR/bin/psql test -c "INSERT INTO t_dup VALUES (1);" || true # unique violation
+$PG_TEST_DIR/bin/psql test -c "INSERT INTO t_check VALUES (0);" || true # check violation
 
 $PG_TEST_DIR/bin/psql -P pager=off test -c "
 -- Check pg_stat_statements
