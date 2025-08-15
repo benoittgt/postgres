@@ -1335,7 +1335,6 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 /*
  * Transaction callback: report when queries are aborted due to transaction rollback
- *
  */
 static void
 pgss_xact_callback(XactEvent event, void *arg)
@@ -1347,12 +1346,6 @@ pgss_xact_callback(XactEvent event, void *arg)
 
 /*
  * Subtransaction callback: log when queries are aborted due to savepoint rollback
- *
- * Parameters:
- * - event: The subtransaction event that occurred
- * - mySubid: The ID of the subtransaction being processed  
- * - parentSubid: The ID of the parent (sub)transaction
- * - arg: User data passed during registration (NULL in our case)
  */
 static void
 pgss_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
@@ -1364,8 +1357,7 @@ pgss_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 }
 
 /*
- * Increment calls_aborted for the currently tracked statement, if any.
- * Safe to call even if module is disabled or the statement key isn't valid.
+ * Increment calls_aborted for the currently tracked statement
  */
 static void
 pgss_count_current_as_aborted(void)
