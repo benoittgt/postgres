@@ -1,0 +1,109 @@
+# pg_stat_statements Spinlock Overhead: Findings
+
+## Background
+
+A `calls_aborted` patch was submitted to pgsql-hackers (2025-08-12). Andres Freund responded that pg_stat_statements has accumulated too much overhead in its spinlock-protected section (~185 instructions with floating-point divisions), measurable even on single-threaded read-only pgbench. This document captures profiling results that quantify and visualize the overhead.
+
+Mailing list threads:
+- Original patch: https://www.postgresql.org/message-id/CAHUgstAuVpiSr1yRXtCR1mT5U9kvkur6P%2BkCs1M0dp1c_mDMUQ%40mail.gmail.com
+- Andres's response: https://www.postgresql.org/message-id/btsjlfnqge3y6yypkwe7yvhv2tcopt6pug7gigz6xaha2iemkw%40lflv3psi7xoz
+- Follow-up: https://www.postgresql.org/message-id/91EB8C15-5A15-4B07-A7CE-6133FB9948AC%40gmail.com
+
+## Test Setup
+
+Instance: AWS EC2 (x86_64, Amazon Linux 2023, GCC 11.5.0)
+Build: PostgreSQL 19devel, `-O2 -g -fno-omit-frame-pointer`, `--without-icu`
+Workload: `pgbench -S -c 1 -T 120` (single client, read-only SELECT by primary key, scale 10)
+Profiling: `perf record -g -F 99` for 30s, `perf stat` for 30s, FlameGraph SVG generation
+Config: `fsync=off`, `full_page_writes=off`, `autovacuum=off` (isolate CPU overhead only)
+
+## Results
+
+### TPS comparison
+
+```
+Without pg_stat_statements: 41,370 TPS (24.2 μs/query)
+With pg_stat_statements:    33,363 TPS (30.0 μs/query)
+Overhead:                    19.4% throughput loss, 5.9 μs per query
+```
+
+### Hardware counters (perf stat, 30s window with pgss enabled)
+
+```
+34.4 billion cycles           (1.883 GHz)
+49.5 billion instructions     (1.44 insn per cycle)
+9.3 billion branches          (506 M/sec)
+96.5 million branch-misses    (1.04%)
+```
+
+### Overhead breakdown from flamegraph
+
+The flamegraph (pgss-bench/results/pgss_flamegraph_ec2_frameptr.svg) shows two distinct sources of overhead.
+
+`pgss_store` (the spinlock-protected section, lines 1417-1517 of pg_stat_statements.c) consumes 0.88% of total CPU. The top consumers inside it are `LWLockRelease` (82M cycles), self-time in pgss_store (58M cycles, covering Welford's variance division and 20+ counter increments), `LWLockAttemptLock` (39M cycles), `__memcmp_evex_movbe` (33M cycles for hash key comparison), and `hash_bytes` (30M cycles for computing the hash).
+
+`clock_gettime` calls under pgss hooks consume 0.81% of total CPU. pg_stat_statements times both planning and execution phases, requiring at least 4 clock reads per query through the vDSO. This costs almost as much as the spinlock section itself.
+
+Hook dispatch self-time (`pgss_ExecutorStart/End/Finish`, `pgss_planner`, `pgss_post_parse_analyze`) adds roughly another 0.5%.
+
+Total pgss-specific overhead: ~2.2% of CPU. This translates to a 19% TPS drop because each query is so fast (24 μs) that 5.9 μs of overhead is proportionally large.
+
+Note: the flamegraph shows 54% of cycles "under" pgss functions inclusively, but this is misleading. `pgss_ExecutorRun` wraps `standard_ExecutorRun`, so all normal query execution (btree walks, buffer management, heap access) appears inside the pgss frame. The 2.2% is the pgss-specific cost that would disappear if the extension were unloaded.
+
+## The Hot Path (lines 1417-1517)
+
+What happens under the `entry->mutex` spinlock for every query:
+
+1. Welford's online variance: floating-point division by `calls[kind]` (line 1441)
+2. Mean/min/max time updates with conditional branches
+3. 12 block counter increments (shared/local/temp hit/read/dirtied/written)
+4. 6 time conversions via `INSTR_TIME_GET_MILLISEC` (shared/local/temp read/write time)
+5. WAL counters: records, fpi, bytes, buffers_full
+6. JIT counters: 8 fields with conditional checks on each
+7. Parallel worker counters
+8. Plan cache counters (generic vs custom)
+9. Usage tracking via `USAGE_EXEC`
+
+## Possible Improvements (not implemented, for future work)
+
+### Move variance computation outside the spinlock
+
+Accumulate `total_time` and `total_time_squared` under the spinlock (two additions), compute variance on read in `pg_stat_statements()` view function. This removes the floating-point division from the hot path. Trade-off: slightly different numerical stability vs Welford, but for query timing statistics the precision loss would be negligible.
+
+### Per-backend buffering with periodic flush
+
+Each backend accumulates counter deltas in process-local memory and flushes to shared memory every N queries or on a timer. This eliminates the spinlock entirely for the common case. Trade-off: statistics become slightly stale, and the flush logic adds complexity. Similar to how `pgstat_report_stat()` works for other stats.
+
+### Split the Counters struct for cache efficiency
+
+The current `Counters` struct packs everything together. Splitting hot fields (calls, total_time) from cold fields (JIT counters, WAL stats, parallel worker counts) into separate cache lines would reduce the amount of memory touched under the spinlock.
+
+### Reduce timing calls
+
+Instead of timing planning and execution separately, consider a single timing bracket around the entire query lifecycle. This would halve the `clock_gettime` overhead. Trade-off: loses the ability to distinguish planning time from execution time.
+
+### Use atomic operations instead of a spinlock
+
+For simple counter increments (calls, rows, block counters), `__sync_fetch_and_add` or C11 atomics would work without any lock. Only the variance computation needs mutual exclusion (and only if kept as Welford). This would allow concurrent updates from multiple backends without contention.
+
+## Reproducing
+
+```bash
+git clone --branch pgss-slow-part https://github.com/benoittgt/postgres.git
+cd postgres/pgss-bench
+chmod +x bench.sh
+./bench.sh
+# Results in pgss-bench/results/
+```
+
+The script handles dependency installation (Debian/Ubuntu via apt, Amazon Linux via dnf), builds PostgreSQL from source, runs both benchmark passes, and generates the flamegraph SVG.
+
+## Lightning Talk Outline (5 min)
+
+Act 1 (~1 min): Show the `calls_aborted` patch. Small, clean, passes tests. Submitted to pgsql-hackers.
+
+Act 2 (~1 min): Andres Freund's quote: "I think it's pretty insane to do things like variance computation while holding a spinlock, for every friggin query execution. The spinlock'ed section is ~185 instructions for me, with plenty high-latency instructions like divisions."
+
+Act 3 (~2 min): Show the numbers. 41,370 vs 33,363 TPS. 5.9 μs per query. Show the flamegraph zoomed into `pgss_store`. Point out the LWLock, the hash lookup, the variance computation. Show the clock_gettime overhead as a surprise finding.
+
+Act 4 (~1 min): What could be done. Per-backend buffering, moving variance to read-time, atomics for simple counters. The community knows this is a problem; it just needs someone to do the work.
