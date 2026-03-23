@@ -68,9 +68,10 @@ CONF
 echo "=== Baseline run (without pg_stat_statements) ==="
 pg_ctl -D "$PG_DATA" -l /tmp/pg.log start -w
 
-pgbench -i -s "$PGBENCH_SCALE" -h /tmp 2>/dev/null
+createdb -h /tmp bench
+pgbench -i -s "$PGBENCH_SCALE" -h /tmp bench 2>/dev/null
 
-pgbench -S -c 1 -T "$BENCH_DURATION" -h /tmp > /tmp/pgbench_baseline.out 2>&1
+pgbench -S -c 1 -T "$BENCH_DURATION" -h /tmp bench > /tmp/pgbench_baseline.out 2>&1
 grep 'tps.*without' /tmp/pgbench_baseline.out | tee "$RESULTS/baseline_tps.txt"
 
 pg_ctl -D "$PG_DATA" stop -w
@@ -82,14 +83,14 @@ echo "shared_preload_libraries = 'pg_stat_statements'" >> "$PG_DATA/postgresql.c
 
 pg_ctl -D "$PG_DATA" -l /tmp/pg.log start -w
 
-psql -h /tmp -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+psql -h /tmp bench -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
 
-pgbench -S -c 1 -T "$BENCH_DURATION" -h /tmp > /tmp/pgbench_pgss.out 2>&1 &
+pgbench -S -c 1 -T "$BENCH_DURATION" -h /tmp bench > /tmp/pgbench_pgss.out 2>&1 &
 PGBENCH_PID=$!
 
 sleep 5
 
-BACKEND_PID=$(psql -h /tmp -Atc \
+BACKEND_PID=$(psql -h /tmp bench -Atc \
   "SELECT pid FROM pg_stat_activity WHERE application_name = 'pgbench' AND pid <> pg_backend_pid() LIMIT 1")
 
 if [ -z "$BACKEND_PID" ]; then
