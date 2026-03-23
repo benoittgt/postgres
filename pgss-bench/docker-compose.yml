@@ -1,0 +1,10 @@
+services:
+  bench:
+    build: .
+    privileged: true
+    volumes:
+      - ..:/pg-src
+      - ./results:/results
+    environment:
+      - PGDATA=/tmp/pgdata
+    command: ["./pgss-bench/bench.sh"]
