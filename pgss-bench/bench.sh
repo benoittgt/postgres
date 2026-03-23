@@ -38,7 +38,8 @@ export PATH="/opt/FlameGraph:$PG_INSTALL/bin:$PATH"
 
 echo "=== Building PostgreSQL ==="
 cd "$PG_SRC"
-./configure --prefix="$PG_INSTALL" --enable-debug CFLAGS="-O2 -g" --without-icu
+./configure --prefix="$PG_INSTALL" --enable-debug CFLAGS="-O2 -g -fno-omit-frame-pointer" --without-icu
+make clean -s 2>/dev/null || true
 make -j"$(nproc)" -s
 make install -s
 
