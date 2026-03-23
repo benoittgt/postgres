@@ -17,6 +17,18 @@ Workload: `pgbench -S -c 1 -T 120` (single client, read-only SELECT by primary k
 Profiling: `perf record -g -F 99` for 30s, `perf stat` for 30s, FlameGraph SVG generation
 Config: `fsync=off`, `full_page_writes=off`, `autovacuum=off` (isolate CPU overhead only)
 
+## How the Sampling Works
+
+The profiling uses Linux `perf`, which is completely external to PostgreSQL -- no code changes or instrumentation needed.
+
+During the pgbench run, we query `pg_stat_activity` to find the backend PID serving the pgbench connection. Then `perf record -g -p <PID> -F 99` tells the kernel to set up a timer interrupt firing 99 times per second on that process. On each interrupt, the kernel captures the current instruction pointer and walks the call stack by following frame pointers up through each function's stack frame. PostgreSQL is unaware this is happening -- it's a kernel-level interrupt, transparent to the profiled process.
+
+Two compile flags make the stacks readable. `-g` embeds a symbol table so perf can translate memory addresses into function names like `pgss_store`. `-fno-omit-frame-pointer` ensures each function's stack frame contains a pointer to its caller's frame, allowing the kernel to walk from the current function all the way up to `main`. Without frame pointers (the GCC default at `-O2`), the stack traces are broken and show `[unknown]` frames.
+
+Over 30 seconds at 99 Hz, we capture ~2,400 stack snapshots. `perf script` dumps these as text, `stackcollapse-perf.pl` merges identical stacks and counts them, and `flamegraph.pl` renders the SVG where each bar's width represents the proportion of samples in which that function appeared. If `pgss_store` shows up in 0.88% of samples, it consumed roughly 0.88% of CPU time.
+
+`perf stat` runs separately and reads hardware performance counters (cycles, instructions, branches, branch-misses) directly from the CPU's Performance Monitoring Unit, giving exact counts rather than statistical estimates.
+
 ## Flamegraph
 
 ![pg_stat_statements overhead flamegraph](pgss_flamegraph_ec2.svg)
