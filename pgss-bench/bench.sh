@@ -13,14 +13,19 @@ PGBENCH_SCALE=10
 
 mkdir -p "$RESULTS"
 
-# ── Phase 0: Install dependencies (Ubuntu/Debian) ──
+# ── Phase 0: Install dependencies ──
 
-if ! command -v perf &>/dev/null; then
+if ! command -v perf &>/dev/null || ! command -v gcc &>/dev/null; then
   echo "=== Installing dependencies ==="
-  sudo apt-get update -qq
-  sudo apt-get install -y -qq build-essential bison flex libreadline-dev \
-    zlib1g-dev libssl-dev pkg-config git "linux-tools-$(uname -r)" 2>/dev/null \
-    || sudo apt-get install -y -qq linux-tools-generic
+  if command -v dnf &>/dev/null; then
+    sudo dnf install -y gcc make bison flex readline-devel zlib-devel \
+      openssl-devel pkg-config git perf
+  elif command -v apt-get &>/dev/null; then
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq build-essential bison flex libreadline-dev \
+      zlib1g-dev libssl-dev pkg-config git "linux-tools-$(uname -r)" 2>/dev/null \
+      || sudo apt-get install -y -qq linux-tools-generic
+  fi
   sudo sysctl -w kernel.perf_event_paranoid=1
 fi
 
