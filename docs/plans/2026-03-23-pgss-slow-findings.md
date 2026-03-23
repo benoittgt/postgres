@@ -17,6 +17,12 @@ Workload: `pgbench -S -c 1 -T 120` (single client, read-only SELECT by primary k
 Profiling: `perf record -g -F 99` for 30s, `perf stat` for 30s, FlameGraph SVG generation
 Config: `fsync=off`, `full_page_writes=off`, `autovacuum=off` (isolate CPU overhead only)
 
+## Flamegraph
+
+![pg_stat_statements overhead flamegraph](pgss_flamegraph_ec2.svg)
+
+Click on functions to zoom in. Look for `pgss_store` (the spinlock section) and `clock_gettime` under pgss hooks.
+
 ## Results
 
 ### TPS comparison
