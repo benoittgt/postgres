@@ -19,7 +19,7 @@ if ! command -v perf &>/dev/null || ! command -v gcc &>/dev/null; then
   echo "=== Installing dependencies ==="
   if command -v dnf &>/dev/null; then
     sudo dnf install -y gcc make bison flex readline-devel zlib-devel \
-      openssl-devel pkg-config git perf perl-FindBin perl-IPC-Run
+      openssl-devel pkg-config git perf perl perl-FindBin perl-IPC-Run
   elif command -v apt-get &>/dev/null; then
     sudo apt-get update -qq
     sudo apt-get install -y -qq build-essential bison flex libreadline-dev \
