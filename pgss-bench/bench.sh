@@ -26,8 +26,8 @@ if ! command -v perf &>/dev/null || ! command -v gcc &>/dev/null; then
       zlib1g-dev libssl-dev pkg-config git "linux-tools-$(uname -r)" 2>/dev/null \
       || sudo apt-get install -y -qq linux-tools-generic
   fi
-  sudo sysctl -w kernel.perf_event_paranoid=1
 fi
+sudo sysctl -w kernel.perf_event_paranoid=1 2>/dev/null || true
 
 if [ ! -d /opt/FlameGraph ]; then
   sudo git clone --depth 1 https://github.com/brendangregg/FlameGraph.git /opt/FlameGraph
@@ -126,7 +126,7 @@ perf script -i /tmp/perf.data \
 
 echo "=== Disassembling pgss_store ==="
 objdump -d "$PG_SRC/contrib/pg_stat_statements/pg_stat_statements.o" \
-  | awk '/^[0-9a-f]+ <pgss_store>:/,/^[0-9a-f]+ <[a-zA-Z_]/' \
+  | awk '/^[0-9a-f]+ <pgss_store>:/,/^$/' \
   > "$RESULTS/pgss_store_disasm.txt"
 echo "  → saved to $RESULTS/pgss_store_disasm.txt"
 
@@ -178,6 +178,48 @@ done
 
 pg_ctl -D "$PG_DATA" stop -w
 
+# ── Phase 6: Mixed workload contention scaling ──
+
+MIXED_SCRIPT="$SCRIPT_DIR/mixed_workload.sql"
+
+echo ""
+echo "=== Mixed workload contention test (10 query types) ==="
+echo "clients baseline_tps pgss_tps overhead_pct" > "$RESULTS/contention_mixed.txt"
+
+# 6a: baseline scaling (no pgss)
+sed -i '/shared_preload_libraries/d' "$PG_DATA/postgresql.conf"
+pg_ctl -D "$PG_DATA" -l /tmp/pg.log start -w
+
+declare -A MIXED_BASELINE_TPS
+for c in $CLIENTS; do
+  tps=$(pgbench -f "$MIXED_SCRIPT" -c "$c" -j "$c" -T "$CONTENTION_DURATION" -h /tmp bench 2>&1 \
+    | grep 'tps.*without' | awk '{print $3}')
+  MIXED_BASELINE_TPS[$c]="$tps"
+  echo "  baseline -c $c: $tps tps"
+done
+
+pg_ctl -D "$PG_DATA" stop -w
+
+# 6b: pgss scaling
+echo "shared_preload_libraries = 'pg_stat_statements'" >> "$PG_DATA/postgresql.conf"
+pg_ctl -D "$PG_DATA" -l /tmp/pg.log start -w
+psql -h /tmp bench -c "SELECT 1" >/dev/null
+
+for c in $CLIENTS; do
+  tps=$(pgbench -f "$MIXED_SCRIPT" -c "$c" -j "$c" -T "$CONTENTION_DURATION" -h /tmp bench 2>&1 \
+    | grep 'tps.*without' | awk '{print $3}')
+  base="${MIXED_BASELINE_TPS[$c]}"
+  if [ -n "$base" ] && [ "$base" != "0" ]; then
+    overhead=$(awk "BEGIN {printf \"%.1f\", (1 - $tps/$base) * 100}")
+  else
+    overhead="N/A"
+  fi
+  echo "  pgss    -c $c: $tps tps (overhead: ${overhead}%)"
+  echo "$c $base $tps $overhead" >> "$RESULTS/contention_mixed.txt"
+done
+
+pg_ctl -D "$PG_DATA" stop -w
+
 # ── Summary ──
 
 echo ""
@@ -191,5 +233,8 @@ cat "$RESULTS/pgss_perf_stat.txt"
 echo ""
 echo "Flamegraph: $RESULTS/pgss_flamegraph.svg"
 echo ""
-echo "Contention scaling:"
+echo "Contention scaling (SELECT-only):"
 column -t "$RESULTS/contention.txt"
+echo ""
+echo "Contention scaling (mixed workload):"
+column -t "$RESULTS/contention_mixed.txt"
