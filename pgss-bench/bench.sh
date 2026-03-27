@@ -122,6 +122,62 @@ perf script -i /tmp/perf.data \
   | flamegraph.pl --title "pg_stat_statements overhead (pgbench -S -c1)" \
   > "$RESULTS/pgss_flamegraph.svg"
 
+# ── Phase 4b: Instruction-level analysis ──
+
+echo "=== Disassembling pgss_store ==="
+objdump -d "$PG_SRC/contrib/pg_stat_statements/pg_stat_statements.o" \
+  | awk '/^[0-9a-f]+ <pgss_store>:/,/^[0-9a-f]+ <[a-zA-Z_]/' \
+  > "$RESULTS/pgss_store_disasm.txt"
+echo "  → saved to $RESULTS/pgss_store_disasm.txt"
+
+echo "=== perf annotate pgss_store ==="
+perf annotate --stdio --symbol=pgss_store -i /tmp/perf.data \
+  > "$RESULTS/pgss_perf_annotate.txt" 2>/dev/null || true
+echo "  → saved to $RESULTS/pgss_perf_annotate.txt"
+
+# ── Phase 5: Contention scaling ──
+
+CLIENTS="1 2 4 8"
+CONTENTION_DURATION=60
+
+echo ""
+echo "=== Contention scaling test ==="
+echo "clients baseline_tps pgss_tps overhead_pct" > "$RESULTS/contention.txt"
+
+# 5a: baseline scaling (remove pgss)
+sed -i '/shared_preload_libraries/d' "$PG_DATA/postgresql.conf"
+pg_ctl -D "$PG_DATA" -l /tmp/pg.log start -w
+
+declare -A BASELINE_TPS
+for c in $CLIENTS; do
+  tps=$(pgbench -S -c "$c" -j "$c" -T "$CONTENTION_DURATION" -h /tmp bench 2>&1 \
+    | grep 'tps.*without' | awk '{print $3}')
+  BASELINE_TPS[$c]="$tps"
+  echo "  baseline -c $c: $tps tps"
+done
+
+pg_ctl -D "$PG_DATA" stop -w
+
+# 5b: pgss scaling
+echo "shared_preload_libraries = 'pg_stat_statements'" >> "$PG_DATA/postgresql.conf"
+pg_ctl -D "$PG_DATA" -l /tmp/pg.log start -w
+psql -h /tmp bench -c "SELECT 1" >/dev/null
+
+for c in $CLIENTS; do
+  tps=$(pgbench -S -c "$c" -j "$c" -T "$CONTENTION_DURATION" -h /tmp bench 2>&1 \
+    | grep 'tps.*without' | awk '{print $3}')
+  base="${BASELINE_TPS[$c]}"
+  if [ -n "$base" ] && [ "$base" != "0" ]; then
+    overhead=$(awk "BEGIN {printf \"%.1f\", (1 - $tps/$base) * 100}")
+  else
+    overhead="N/A"
+  fi
+  echo "  pgss    -c $c: $tps tps (overhead: ${overhead}%)"
+  echo "$c $base $tps $overhead" >> "$RESULTS/contention.txt"
+done
+
+pg_ctl -D "$PG_DATA" stop -w
+
 # ── Summary ──
 
 echo ""
@@ -134,3 +190,6 @@ echo ""
 cat "$RESULTS/pgss_perf_stat.txt"
 echo ""
 echo "Flamegraph: $RESULTS/pgss_flamegraph.svg"
+echo ""
+echo "Contention scaling:"
+column -t "$RESULTS/contention.txt"
