@@ -11,10 +11,11 @@ Mailing list threads:
 
 ## Test Setup
 
-Instance: AWS EC2 (x86_64, Amazon Linux 2023, GCC 11.5.0)
+Single-client profiling: AWS EC2 t3.micro (x86_64, Amazon Linux 2023, GCC 11.5.0)
+Contention scaling: AWS EC2 c6i.2xlarge (8 vCPUs, non-burstable)
 Build: PostgreSQL 19devel, `-O2 -g -fno-omit-frame-pointer`, `--without-icu`
-Workload: `pgbench -S -c 1 -T 120` (single client, read-only SELECT by primary key, scale 10)
-Profiling: `perf record -g -F 99` for 30s, `perf stat` for 30s, FlameGraph SVG generation
+Workload: `pgbench -S` (SELECT-only) and custom mixed script (10 query types)
+Profiling: `perf record -g -F 99` for 30s, `objdump` disassembly, FlameGraph SVG generation
 Config: `fsync=off`, `full_page_writes=off`, `autovacuum=off` (isolate CPU overhead only)
 
 ## How the Sampling Works
@@ -34,6 +35,12 @@ Over 30 seconds at 99 Hz, we capture ~2,400 stack snapshots. `perf script` dumps
 ![pg_stat_statements overhead flamegraph](pgss_flamegraph_ec2.svg)
 
 Click on functions to zoom in. Look for `pgss_store` (the spinlock section) and `clock_gettime` under pgss hooks.
+
+### Annotated version
+
+![Annotated flamegraph](pgss_flamegraph_ec2_annotated.svg)
+
+The annotated version recolors pgss-specific frames: red for `pgss_store` (the spinlock section), blue for `clock_gettime` (timing calls), orange for hook dispatch functions, and muted green for wrapper functions like `pgss_ExecutorRun` that contain normal query execution. Callout labels highlight the three key areas of overhead.
 
 ## Results
 
@@ -104,6 +111,52 @@ Instead of timing planning and execution separately, consider a single timing br
 
 For simple counter increments (calls, rows, block counters), `__sync_fetch_and_add` or C11 atomics would work without any lock. Only the variance computation needs mutual exclusion (and only if kept as Welford). This would allow concurrent updates from multiple backends without contention.
 
+## Instruction-Level Analysis
+
+Disassembling the compiled `pgss_store` function with `objdump` and counting instructions between `SpinLockAcquire` (`lock xchg`) and `SpinLockRelease` (`movb $0x0`) gives 233 instructions in the spinlock-protected section, with 16 `divsd` (double-precision floating-point division) instructions. Andres estimated ~185 instructions; the actual count is worse.
+
+The 16 divisions come from Welford's variance computation across multiple timing categories. Each `divsd` on modern x86 has a latency of 13-20 cycles and cannot be pipelined when there are data dependencies. That's 200-320 cycles of division alone inside the spinlock, during which every other backend wanting to update pgss must spin-wait.
+
+`perf annotate` confirmed `pgss_store` is being sampled (though only 4 samples fell inside the function during our 30s window, too few for per-instruction breakdown). A longer profiling window or higher sampling frequency would improve granularity.
+
+## Contention Scaling
+
+To test Andres's claim that pgss overhead makes it "practically unusable for any busy workload", we ran pgbench at increasing concurrency on a c6i.2xlarge (8 vCPUs, non-burstable) with and without pgss.
+
+### SELECT-only workload (`pgbench -S`)
+
+```
+clients  baseline_tps    pgss_tps        overhead
+1        20,077          19,433          3.2%
+2        40,628          38,679          4.8%
+4        63,714          60,973          4.3%
+8        151,052         141,126         6.6%
+```
+
+The overhead roughly doubles from `-c 1` to `-c 8` (3.2% to 6.6%), confirming that contention amplifies the per-query cost. At `-c 8`, that's ~10,000 lost TPS.
+
+### Mixed workload (10 query types)
+
+We also tested with a mixed script containing PK lookups, range scans, joins, aggregates, updates, inserts, and subqueries to approximate a more realistic workload.
+
+```
+clients  baseline_tps  pgss_tps  overhead
+1        137           134       2.3%
+2        214           209       2.3%
+4        288           289       noise
+8        346           343       1.1%
+```
+
+The overhead disappears into measurement noise. Each mixed query takes ~7.3ms on average, so the fixed ~6μs pgss overhead is only 0.08% of query time. This tells us that pgss overhead is a fixed per-query cost, not a percentage. It becomes significant for sub-millisecond OLTP workloads (simple index lookups, key-value access patterns) where the per-query overhead is a meaningful fraction of query time, but is invisible when queries take multiple milliseconds.
+
+### What this means
+
+Andres's critique is specifically about high-throughput OLTP workloads where queries are sub-millisecond. A production system doing 100k simple lookups per second loses thousands of TPS to pgss bookkeeping. The contention scaling from 3.2% to 6.6% on just 8 clients suggests the problem gets worse on larger machines with 32+ cores. For typical mixed workloads with slower queries, pgss overhead is negligible in practice.
+
+### Note on hardware counters
+
+EC2 virtualized instances (including c6i.2xlarge) do not expose CPU Performance Monitoring Unit counters to the guest. `perf stat` shows `<not supported>` for cycles, instructions, and branches. Bare-metal instances (`.metal` suffix) or physical hardware would be needed for exact instruction and cycle counts via `perf stat`.
+
 ## Reproducing
 
 ```bash
@@ -122,6 +175,6 @@ Act 1 (~1 min): Show the `calls_aborted` patch. Small, clean, passes tests. Subm
 
 Act 2 (~1 min): Andres Freund's quote: "I think it's pretty insane to do things like variance computation while holding a spinlock, for every friggin query execution. The spinlock'ed section is ~185 instructions for me, with plenty high-latency instructions like divisions."
 
-Act 3 (~2 min): Show the numbers. 41,370 vs 33,363 TPS. 5.9 μs per query. Show the flamegraph zoomed into `pgss_store`. Point out the LWLock, the hash lookup, the variance computation. Show the clock_gettime overhead as a surprise finding.
+Act 3 (~2 min): Show the numbers. 41,370 vs 33,363 TPS on single client. Show the flamegraph zoomed into `pgss_store`. Point out the LWLock, the hash lookup, the variance computation. Show the clock_gettime overhead as a surprise finding. Reveal: 233 instructions in the spinlocked section (more than Andres's estimate), 16 floating-point divisions.
 
-Act 4 (~1 min): What could be done. Per-backend buffering, moving variance to read-time, atomics for simple counters. The community knows this is a problem; it just needs someone to do the work.
+Act 4 (~1 min): Show the contention scaling table. Overhead doubles from 3.2% to 6.6% on just 8 clients. Then show the mixed workload result: overhead vanishes when queries take milliseconds instead of microseconds. The punchline: pgss's problem is specifically about high-throughput fast-query workloads, and it gets worse with more cores. What could be done: per-backend buffering, moving variance to read-time, atomics for simple counters.
