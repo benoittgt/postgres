@@ -131,9 +131,12 @@ clients  baseline_tps    pgss_tps        overhead
 2        40,628          38,679          4.8%
 4        63,714          60,973          4.3%
 8        151,052         141,126         6.6%
+16       139,531         130,559         6.4%
+32       133,165         121,773         8.6%
+64       132,067         123,745         6.3%
 ```
 
-The overhead roughly doubles from `-c 1` to `-c 8` (3.2% to 6.6%), confirming that contention amplifies the per-query cost. At `-c 8`, that's ~10,000 lost TPS.
+The overhead nearly triples from `-c 1` to `-c 32` (3.2% to 8.6%), confirming that contention amplifies the per-query cost. At `-c 8`, that's ~10,000 lost TPS. The peak at `-c 32` (8.6%) then drops at `-c 64` (6.3%) because with only 8 vCPUs, extreme oversubscription shifts the bottleneck from spinlock contention to OS scheduling. On a machine with 32+ physical cores, the contention curve would likely continue climbing since all backends could run and hit the spinlock simultaneously.
 
 ### Mixed workload (10 query types)
 
