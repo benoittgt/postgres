@@ -5,9 +5,11 @@
 A `calls_aborted` patch was submitted to pgsql-hackers (2025-08-12). Andres Freund responded that pg_stat_statements has accumulated too much overhead in its spinlock-protected section (~185 instructions with floating-point divisions), measurable even on single-threaded read-only pgbench. This document captures profiling results that quantify and visualize the overhead.
 
 Mailing list threads:
-- Original patch: https://www.postgresql.org/message-id/CAHUgstAuVpiSr1yRXtCR1mT5U9kvkur6P%2BkCs1M0dp1c_mDMUQ%40mail.gmail.com
-- Andres's response: https://www.postgresql.org/message-id/btsjlfnqge3y6yypkwe7yvhv2tcopt6pug7gigz6xaha2iemkw%40lflv3psi7xoz
+- Original `calls_aborted` patch: https://www.postgresql.org/message-id/CAHUgstAuVpiSr1yRXtCR1mT5U9kvkur6P%2BkCs1M0dp1c_mDMUQ%40mail.gmail.com
+- Andres's response on overhead: https://www.postgresql.org/message-id/btsjlfnqge3y6yypkwe7yvhv2tcopt6pug7gigz6xaha2iemkw%40lflv3psi7xoz
 - Follow-up: https://www.postgresql.org/message-id/91EB8C15-5A15-4B07-A7CE-6133FB9948AC%40gmail.com
+- Generic/custom plan counters (splitting discussion): https://www.postgresql.org/message-id/flat/aILaHupXbIGgF2wJ%40paquier.xyz
+- Lukas Fittl on pgss LWLock contention and `pgss_info`: https://www.postgresql.org/message-id/CAP53PkzYZ8YxH0o+Garw9fWdFRoEtmQKT09-q=2RVMW8uVS5Nw@mail.gmail.com
 
 ## Test Setup
 
@@ -147,6 +149,20 @@ The overhead disappears into measurement noise. Each mixed query takes ~7.3ms on
 ### What this means
 
 Andres's critique is specifically about high-throughput OLTP workloads where queries are sub-millisecond. A production system doing 100k+ simple lookups per second loses thousands of TPS to pgss bookkeeping. The contention scaling from 3.2% to 8.6% on an 8-vCPU machine suggests the problem gets worse on larger machines with 32+ cores where more backends contend simultaneously. For typical mixed workloads with slower queries, pgss overhead is negligible in practice.
+
+## Community Context
+
+The overhead problem is widely acknowledged on pgsql-hackers but no fix has shipped yet.
+
+Michael Paquier declared a moratorium on new pgss columns after bumping it to 1.13: "the size of the change in pg_stat_statements--1.12--1.13.sql points that we should seriously consider splitting these attributes into multiple sub-functions." Each release adds counters (WAL stats, JIT stats, parallel workers, generic/custom plan calls) to the same spinlocked `Counters` struct. Each addition is small in isolation, but the cumulative effect is 233 instructions under a spinlock.
+
+Sami Imseih (AWS) flagged overhead when designing the generic/custom plan counters: "I really don't want us making an extra `pgss_store` call in ExecutorStart since it will add significant overhead." Even the people adding features to pgss are aware of the per-call cost.
+
+Andrei Lepikhov proposed a callback-based or subscription-based model where extensions track only the parameters they need, rather than the current monolithic struct. This would break the pattern of stuffing everything into one spinlocked section.
+
+Lukas Fittl (pganalyze) reported real-world LWLock contention from a different angle: "Over the last weeks we've been fighting again with pg_stat_statements issues." His pain is about `LWLock:pg_stat_statements` during view reads and GC storms, not the per-query spinlock, but it's the same module under pressure from multiple directions. He proposed adding `pgss_info` for GC observability and is prototyping a `pg_stat_statements_next` module on GitHub.
+
+The per-backend buffering approach has strong precedent: Andres Freund himself rewrote PostgreSQL's core stats system in PG15 to use exactly this model (per-backend accumulation with periodic flush via `pgstat_report_stat()`). pgss still uses the old spinlock-per-update architecture that the main stats system abandoned.
 
 ## Possible Improvements (not implemented, for future work)
 
